@@ -110,6 +110,41 @@ def get_categories():
     ])
 
 
+@inventory_bp.route('/api/inventory/session/<int:session_id>', methods=['GET'])
+def get_inventory_session(session_id):
+    """Get a session with all its items — used by confirm page."""
+    db = Session()
+    try:
+        session = db.query(InventorySession).get(session_id)
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+
+        return jsonify({
+            'session_id': session.id,
+            'year': session.year,
+            'month': session.month,
+            'status': session.status,
+            'total_value': session.total_value,
+            'raw_input': session.raw_input,
+            'items': [{
+                'id': item.id,
+                'name': item.name,
+                'category': item.category,
+                'supplier_name': item.supplier_name,
+                'quantity': item.quantity,
+                'unit': item.unit,
+                'price_per_unit': item.price_per_unit,
+                'trimming_loss_pct': item.trimming_loss_pct,
+                'adjusted_price': item.adjusted_price,
+                'is_recipe_product': item.is_recipe_product,
+                'value': item.value,
+                'notes': item.notes
+            } for item in session.items]
+        })
+    finally:
+        db.close()
+
+
 # ── Edit Inventory Item ────────────────────────────────────────────────
 
 @inventory_bp.route('/api/inventory/item/<int:item_id>', methods=['PUT'])
