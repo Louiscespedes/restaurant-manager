@@ -21,12 +21,12 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 CORS(app)  # Allow Lovable frontend to connect
 
+# Create database tables on startup (MUST happen before FortnoxClient)
+init_db()
+
 # Initialize Fortnox client
 fortnox = FortnoxClient(Session)
 sync = SyncService(fortnox)
-
-# Create database tables on startup
-init_db()
 
 
 # ── Health Check ───────────────────────────────────────────────────────
