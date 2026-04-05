@@ -25,6 +25,9 @@ FORTNOX_API_BASE = 'https://api.fortnox.se/3'
 FORTNOX_AUTH_URL = 'https://apps.fortnox.se/oauth-v1/auth'
 FORTNOX_TOKEN_URL = 'https://apps.fortnox.se/oauth-v1/token'
 
+# Anthropic (Claude AI) — for smart inventory parsing
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+
 # App settings
 PORT = int(os.environ.get('PORT', 5000))
 DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
