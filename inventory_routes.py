@@ -8,6 +8,7 @@ from models import (
     Session, InventorySession, InventoryItem, ReviewQuestion,
     Product, Supplier, Recipe, RecipeIngredient
 )
+from ai_parser import parse_inventory_with_ai, generate_smart_questions
 
 inventory_bp = Blueprint('inventory', __name__)
 
@@ -190,15 +191,30 @@ def process_inventory_text():
         db.add(session)
         db.flush()
 
-        # Parse the text into items using simple heuristics
-        # (In production, this would use Claude API for smart parsing)
-        items = _parse_inventory_text(raw_text, session.id, db)
+        # Try AI parsing first, fall back to regex
+        ai_result = parse_inventory_with_ai(raw_text, db)
+
+        if ai_result and 'items' in ai_result:
+            # AI parsed successfully — convert to InventoryItem objects
+            items = _create_items_from_ai(ai_result['items'], session.id, db)
+        else:
+            # Fallback to regex parser
+            items = _parse_inventory_text(raw_text, session.id, db)
 
         for item in items:
             db.add(item)
+        db.flush()  # Get item IDs before generating questions
 
-        # Generate review questions
-        questions = _generate_review_questions(items, session.id, db)
+        # Generate review questions (AI-powered if available)
+        if ai_result and 'items' in ai_result:
+            ai_questions = generate_smart_questions(ai_result['items'], None, db)
+            if ai_questions and 'questions' in ai_questions:
+                questions = _create_questions_from_ai(ai_questions['questions'], items, session.id)
+            else:
+                questions = _generate_review_questions(items, session.id, db)
+        else:
+            questions = _generate_review_questions(items, session.id, db)
+
         for q in questions:
             db.add(q)
 
@@ -216,6 +232,58 @@ def process_inventory_text():
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
+
+
+def _create_items_from_ai(ai_items, session_id, db):
+    """Convert AI-parsed items into InventoryItem objects."""
+    items = []
+    for ai_item in ai_items:
+        item = InventoryItem(
+            session_id=session_id,
+            raw_name=ai_item.get('raw_input', ''),
+            name=ai_item.get('name', ai_item.get('raw_input', 'Unknown')),
+            quantity=ai_item.get('quantity'),
+            unit=ai_item.get('unit'),
+            price_per_unit=ai_item.get('price_per_unit'),
+            category=ai_item.get('category'),
+            supplier_name=ai_item.get('supplier_name'),
+            notes=ai_item.get('notes')
+        )
+
+        # Link to matched product if AI found one
+        matched_id = ai_item.get('matched_product_id')
+        if matched_id:
+            product = db.query(Product).get(matched_id)
+            if product:
+                item.product_id = product.id
+                if not item.price_per_unit and product.current_price:
+                    item.price_per_unit = product.current_price
+
+        # Calculate value
+        if item.price_per_unit and item.quantity:
+            item.value = round(item.price_per_unit * item.quantity, 2)
+
+        items.append(item)
+    return items
+
+
+def _create_questions_from_ai(ai_questions, items, session_id):
+    """Convert AI-generated questions into ReviewQuestion objects."""
+    questions = []
+    for i, aq in enumerate(ai_questions):
+        item_index = aq.get('item_index', 0)
+        item = items[item_index] if item_index < len(items) else None
+
+        q = ReviewQuestion(
+            session_id=session_id,
+            item_id=item.id if item else None,
+            question_type=aq.get('question_type', 'missing_price'),
+            question_text=aq.get('question_text', ''),
+            options=json.dumps(aq.get('options', [])),
+            order=i
+        )
+        questions.append(q)
+    return questions
 
 
 def _parse_inventory_text(raw_text, session_id, db):
