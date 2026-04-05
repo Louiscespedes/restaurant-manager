@@ -14,12 +14,14 @@ from models import (
 )
 from fortnox_client import FortnoxClient
 from sync_service import SyncService
+from inventory_routes import inventory_bp
 
 # ── App Setup ──────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 CORS(app)  # Allow Lovable frontend to connect
+app.register_blueprint(inventory_bp)
 
 # Create database tables on startup (MUST happen before FortnoxClient)
 init_db()
