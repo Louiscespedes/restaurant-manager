@@ -52,18 +52,31 @@ KNOWN PRODUCTS IN DATABASE:
 KNOWN RECIPES:
 {recipes_context}
 
-CATEGORIES TO USE:
-Meat, Fish & Seafood, Dairy, Produce / Vegetables, Fruit, Dry Goods, Oils & Condiments, Beverages, Frozen, Bakery, Finished Products, Other
+CATEGORIES — you MUST assign one to every item based on what the product is:
+- Meat: beef, pork, chicken, lamb, duck, wagyu, entrecôte, fläsk, kyckling, lamm, anka, nötkött, färs, korv, bacon, skinka
+- Fish & Seafood: salmon, tuna, cod, shrimp, lobster, lax, torsk, räkor, hummer, skaldjur, musslor, bläckfisk, krabba
+- Dairy: milk, cream, butter, cheese, yogurt, mjölk, grädde, smör, ost, crème fraiche, mascarpone, parmesan
+- Produce / Vegetables: carrot, onion, potato, tomato, zucchini, lettuce, morot, lök, potatis, tomat, sallad, gurka, paprika, svamp, vitlök, purjolök, selleri, broccoli, spenat, ruccola
+- Fruit: banana, apple, lemon, lime, orange, berry, banan, äpple, citron, apelsin, bär, hallon, jordgubbar, mango, avocado
+- Dry Goods: flour, rice, pasta, sugar, salt, mjöl, ris, socker, linser, bönor, couscous, quinoa, nötter
+- Oils & Condiments: olive oil, vinegar, soy sauce, olivolja, vinäger, soja, senap, ketchup, majonnäs, rapsolja, sesam, truffle oil, balsamico, kryddor, peppar
+- Beverages: wine, beer, juice, water, coffee, vin, öl, juice, vatten, kaffe, te, läsk, mineralvatten, tonic
+- Frozen: anything frozen/fryst, glass (ice cream), frysta bär, frysta grönsaker
+- Bakery: bread, bröd, bullar, croissant, deg, jäst
+- Finished Products: sauces, stocks, ice cream, prepared foods you make in-house — sås, buljong, glass, fond, aioli
+- Other: cleaning supplies, packaging, disposables, folie, diskmedel, servetter
 
 RULES:
 1. Extract each item with: name, quantity, unit (kg/g/st/liter), price_per_unit (if mentioned), category, supplier (if mentioned)
-2. Match items to known products when possible — use the exact product name from the database
-3. Understand Swedish: "lax" = salmon, "kött" = meat, "mejeri" = dairy, "grönsaker" = vegetables, etc.
-4. Recognize trimming keywords: "rensad", "filead", "putsad", "trimmed", "skuren" — flag these with needs_trimming_review: true
-5. Recognize finished/recipe products: "färdig", "hemlagad", "homemade", "prepared" — flag with needs_recipe_review: true
-6. If a product name could match multiple known products, flag with needs_disambiguation: true and list the possible matches
-7. If price is missing but the product exists in the database, use the database price
-8. Handle messy formats: "10kg lax 450kr", "salmon 10 kilo", "3st olivolja flaskor", etc.
+2. ALWAYS assign a category — use your knowledge of food and cooking. Every ingredient belongs somewhere. Never leave category empty or null.
+3. Match items to known products when possible — use the exact product name from the database
+4. Understand Swedish AND English — this is a Swedish restaurant so input may be in either language or mixed
+5. Recognize trimming keywords: "rensad", "filead", "putsad", "trimmed", "skuren" — flag these with needs_trimming_review: true
+6. Recognize finished/recipe products: "färdig", "hemlagad", "homemade", "prepared" — flag with needs_recipe_review: true
+7. If a product name could match multiple known products, flag with needs_disambiguation: true and list the possible matches
+8. If price is missing but the product exists in the database, use the database price
+9. Handle messy formats: "10kg lax 450kr", "salmon 10 kilo", "3st olivolja flaskor", etc.
+10. Clean up product names to be readable — "lax" becomes "Lax (Salmon)", "morötter" becomes "Morötter"
 
 RAW INVENTORY TEXT:
 {raw_text}
