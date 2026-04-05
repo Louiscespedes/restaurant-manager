@@ -131,6 +131,103 @@ class SyncLog(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
+class InventorySession(Base):
+    """A monthly inventory session — one per month."""
+    __tablename__ = 'inventory_sessions'
+
+    id = Column(Integer, primary_key=True)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)
+    status = Column(String, default='draft')  # draft, reviewing, confirmed
+    raw_input = Column(Text, nullable=True)  # Original messy text or voice transcript
+    total_value = Column(Float, nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    items = relationship('InventoryItem', back_populates='session', cascade='all, delete-orphan')
+    questions = relationship('ReviewQuestion', back_populates='session', cascade='all, delete-orphan')
+
+
+class InventoryItem(Base):
+    """A single item in an inventory — product + quantity + value."""
+    __tablename__ = 'inventory_items'
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey('inventory_sessions.id'), nullable=False)
+    product_id = Column(Integer, ForeignKey('products.id'), nullable=True)
+    raw_name = Column(String, nullable=True)  # Original name from user input
+    name = Column(String, nullable=False)
+    category = Column(String, nullable=True)
+    supplier_name = Column(String, nullable=True)
+    quantity = Column(Float, nullable=True)
+    unit = Column(String, nullable=True)  # kg, st, liter, etc.
+    price_per_unit = Column(Float, nullable=True)
+    trimming_loss_pct = Column(Float, default=0)  # e.g. 20 for 20%
+    adjusted_price = Column(Float, nullable=True)  # price after trimming loss
+    is_recipe_product = Column(Boolean, default=False)
+    recipe_id = Column(Integer, ForeignKey('recipes.id'), nullable=True)
+    value = Column(Float, nullable=True)  # final calculated value
+    notes = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship('InventorySession', back_populates='items')
+    product = relationship('Product')
+    recipe = relationship('Recipe')
+
+
+class ReviewQuestion(Base):
+    """AI-generated review questions for inventory disambiguation."""
+    __tablename__ = 'review_questions'
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey('inventory_sessions.id'), nullable=False)
+    item_id = Column(Integer, ForeignKey('inventory_items.id'), nullable=True)
+    question_type = Column(String, nullable=False)  # product_match, cut_variant, trimming_loss, recipe_cost
+    question_text = Column(String, nullable=False)
+    options = Column(Text, nullable=True)  # JSON array of options
+    answer = Column(String, nullable=True)
+    is_answered = Column(Boolean, default=False)
+    order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship('InventorySession', back_populates='questions')
+    item = relationship('InventoryItem')
+
+
+class Recipe(Base):
+    """Restaurant recipes — used for costing finished products in inventory."""
+    __tablename__ = 'recipes'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    total_yield = Column(Float, nullable=True)  # e.g. 2 (liters)
+    yield_unit = Column(String, nullable=True)  # e.g. 'liter', 'kg', 'portions'
+    total_cost = Column(Float, nullable=True)  # sum of ingredient costs
+    cost_per_unit = Column(Float, nullable=True)  # total_cost / total_yield
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    ingredients = relationship('RecipeIngredient', back_populates='recipe', cascade='all, delete-orphan')
+
+
+class RecipeIngredient(Base):
+    """Ingredients in a recipe — links to products for price lookup."""
+    __tablename__ = 'recipe_ingredients'
+
+    id = Column(Integer, primary_key=True)
+    recipe_id = Column(Integer, ForeignKey('recipes.id'), nullable=False)
+    product_id = Column(Integer, ForeignKey('products.id'), nullable=True)
+    name = Column(String, nullable=False)
+    quantity = Column(Float, nullable=True)
+    unit = Column(String, nullable=True)
+    cost = Column(Float, nullable=True)
+
+    recipe = relationship('Recipe', back_populates='ingredients')
+    product = relationship('Product')
+
+
 def init_db():
     """Create all tables and return a session."""
     Base.metadata.create_all(engine)
