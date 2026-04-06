@@ -686,3 +686,206 @@ def get_recipe_detail(recipe_id):
         })
     finally:
         db.close()
+
+
+@inventory_bp.route('/api/recipes', methods=['POST'])
+def create_recipe():
+    """Create a new recipe with ingredients."""
+    db = Session()
+    try:
+        data = request.json
+        recipe = Recipe(
+            name=data.get('name', ''),
+            total_yield=data.get('total_yield'),
+            yield_unit=data.get('yield_unit', 'portions'),
+            notes=data.get('notes')
+        )
+        db.add(recipe)
+        db.flush()
+
+        total_cost = 0
+        for ing_data in data.get('ingredients', []):
+            cost = ing_data.get('cost', 0) or 0
+            ing = RecipeIngredient(
+                recipe_id=recipe.id,
+                product_id=ing_data.get('product_id'),
+                name=ing_data.get('name', ''),
+                quantity=ing_data.get('quantity'),
+                unit=ing_data.get('unit'),
+                cost=cost
+            )
+            db.add(ing)
+            total_cost += cost
+
+        recipe.total_cost = round(total_cost, 2)
+        if recipe.total_yield and recipe.total_yield > 0:
+            recipe.cost_per_unit = round(total_cost / recipe.total_yield, 2)
+
+        db.commit()
+        return jsonify({
+            'id': recipe.id,
+            'name': recipe.name,
+            'total_cost': recipe.total_cost,
+            'cost_per_unit': recipe.cost_per_unit
+        }), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/recipes/<int:recipe_id>', methods=['PUT'])
+def update_recipe(recipe_id):
+    """Update a recipe and its ingredients."""
+    db = Session()
+    try:
+        recipe = db.query(Recipe).get(recipe_id)
+        if not recipe:
+            return jsonify({'error': 'Recipe not found'}), 404
+
+        data = request.json
+        if 'name' in data:
+            recipe.name = data['name']
+        if 'total_yield' in data:
+            recipe.total_yield = data['total_yield']
+        if 'yield_unit' in data:
+            recipe.yield_unit = data['yield_unit']
+        if 'notes' in data:
+            recipe.notes = data['notes']
+
+        # Replace ingredients if provided
+        if 'ingredients' in data:
+            # Remove old ingredients
+            for old_ing in recipe.ingredients:
+                db.delete(old_ing)
+
+            total_cost = 0
+            for ing_data in data['ingredients']:
+                cost = ing_data.get('cost', 0) or 0
+                ing = RecipeIngredient(
+                    recipe_id=recipe.id,
+                    product_id=ing_data.get('product_id'),
+                    name=ing_data.get('name', ''),
+                    quantity=ing_data.get('quantity'),
+                    unit=ing_data.get('unit'),
+                    cost=cost
+                )
+                db.add(ing)
+                total_cost += cost
+
+            recipe.total_cost = round(total_cost, 2)
+            if recipe.total_yield and recipe.total_yield > 0:
+                recipe.cost_per_unit = round(total_cost / recipe.total_yield, 2)
+
+        db.commit()
+        return jsonify({'status': 'updated', 'id': recipe.id})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/recipes/<int:recipe_id>', methods=['DELETE'])
+def delete_recipe(recipe_id):
+    """Delete a recipe."""
+    db = Session()
+    try:
+        recipe = db.query(Recipe).get(recipe_id)
+        if not recipe:
+            return jsonify({'error': 'Recipe not found'}), 404
+        db.delete(recipe)
+        db.commit()
+        return jsonify({'status': 'deleted'})
+    finally:
+        db.close()
+
+
+# ── Export ─────────────────────────────────────────────────────────────
+
+@inventory_bp.route('/api/inventory/export/<int:session_id>', methods=['GET'])
+def export_inventory(session_id):
+    """Export inventory as JSON (frontend converts to PDF/Excel)."""
+    db = Session()
+    try:
+        session = db.query(InventorySession).get(session_id)
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+
+        # Group items by category
+        categories = {}
+        for item in session.items:
+            cat = item.category or 'Uncategorized'
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append({
+                'name': item.name,
+                'quantity': item.quantity,
+                'unit': item.unit,
+                'price_per_unit': item.price_per_unit,
+                'trimming_loss_pct': item.trimming_loss_pct,
+                'adjusted_price': item.adjusted_price,
+                'value': item.value,
+                'supplier_name': item.supplier_name
+            })
+
+        return jsonify({
+            'session_id': session.id,
+            'year': session.year,
+            'month': session.month,
+            'total_value': session.total_value,
+            'confirmed_at': session.confirmed_at.isoformat() if session.confirmed_at else None,
+            'item_count': len(session.items),
+            'categories': categories
+        })
+    finally:
+        db.close()
+
+
+# ── Dashboard / Trends ─────────────────────────────────────────────────
+
+@inventory_bp.route('/api/inventory/trends', methods=['GET'])
+def get_inventory_trends():
+    """Get inventory value trends over time for dashboard."""
+    db = Session()
+    try:
+        sessions = db.query(InventorySession).filter_by(
+            status='confirmed'
+        ).order_by(InventorySession.year, InventorySession.month).all()
+
+        trends = [{
+            'year': s.year,
+            'month': s.month,
+            'label': f'{s.year}-{s.month:02d}',
+            'total_value': s.total_value or 0,
+            'item_count': len(s.items)
+        } for s in sessions]
+
+        # Category breakdown for latest inventory
+        category_breakdown = {}
+        if sessions:
+            latest = sessions[-1]
+            for item in latest.items:
+                cat = item.category or 'Uncategorized'
+                if cat not in category_breakdown:
+                    category_breakdown[cat] = {'count': 0, 'value': 0}
+                category_breakdown[cat]['count'] += 1
+                category_breakdown[cat]['value'] += item.value or 0
+
+        # Month-over-month change
+        mom_change = None
+        if len(sessions) >= 2:
+            current = sessions[-1].total_value or 0
+            previous = sessions[-2].total_value or 0
+            if previous > 0:
+                mom_change = round(((current - previous) / previous) * 100, 1)
+
+        return jsonify({
+            'trends': trends,
+            'category_breakdown': category_breakdown,
+            'month_over_month_change': mom_change,
+            'total_inventories': len(sessions)
+        })
+    finally:
+        db.close()
