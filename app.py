@@ -49,6 +49,12 @@ _migration_sql = [
     "ALTER TABLE menus ADD COLUMN IF NOT EXISTS selling_price FLOAT",
     "ALTER TABLE menus ADD COLUMN IF NOT EXISTS food_cost_pct FLOAT",
     "ALTER TABLE menus ADD COLUMN IF NOT EXISTS margin FLOAT",
+    # Recipe price review columns
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS price_review_status TEXT DEFAULT 'pending'",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS price_per_unit FLOAT",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS price_unit TEXT",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS price_source TEXT",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS needs_review BOOLEAN DEFAULT FALSE",
 ]
 try:
     with _engine.connect() as _conn:
