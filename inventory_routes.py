@@ -1002,7 +1002,7 @@ def get_inventory_trends():
 # ══════════════════════════════════════════════════════════════════════
 
 def _recalc_dish_cost(dish, db):
-    """Recalculate total_cost and cost_per_serving for a dish."""
+    """Recalculate total_cost, cost_per_serving, food_cost_pct, and margin for a dish."""
     total = 0.0
     for dr in dish.dish_recipes:
         recipe = db.query(Recipe).get(dr.recipe_id)
@@ -1016,6 +1016,13 @@ def _recalc_dish_cost(dish, db):
             total += di.cost
     dish.total_cost = round(total, 2)
     dish.cost_per_serving = round(total / (dish.servings or 1), 2)
+    # Food cost % and margin
+    if dish.selling_price and dish.selling_price > 0:
+        dish.food_cost_pct = round((dish.cost_per_serving / dish.selling_price) * 100, 1)
+        dish.margin = round(dish.selling_price - dish.cost_per_serving, 2)
+    else:
+        dish.food_cost_pct = None
+        dish.margin = None
 
 
 def _calc_ingredient_cost(ing, db):
@@ -1059,6 +1066,9 @@ def get_dishes():
             'servings': d.servings,
             'total_cost': d.total_cost,
             'cost_per_serving': d.cost_per_serving,
+            'selling_price': d.selling_price,
+            'food_cost_pct': d.food_cost_pct,
+            'margin': d.margin,
             'photos': json.loads(d.photos) if d.photos else [],
             'recipe_count': len(d.dish_recipes),
             'ingredient_count': len(d.dish_ingredients),
@@ -1085,6 +1095,9 @@ def get_dish(dish_id):
             'servings': d.servings,
             'total_cost': d.total_cost,
             'cost_per_serving': d.cost_per_serving,
+            'selling_price': d.selling_price,
+            'food_cost_pct': d.food_cost_pct,
+            'margin': d.margin,
             'photos': json.loads(d.photos) if d.photos else [],
             'created_at': d.created_at.isoformat() if d.created_at else None,
             'updated_at': d.updated_at.isoformat() if d.updated_at else None,
@@ -1127,6 +1140,7 @@ def create_dish():
             description=data.get('description'),
             added_by=data.get('added_by'),
             servings=data.get('servings', 1),
+            selling_price=data.get('selling_price'),
             photos=json.dumps(data.get('photos', [])),
         )
         db.add(dish)
@@ -1186,6 +1200,8 @@ def update_dish(dish_id):
         dish.description = data.get('description', dish.description)
         dish.added_by = data.get('added_by', dish.added_by)
         dish.servings = data.get('servings', dish.servings)
+        if 'selling_price' in data:
+            dish.selling_price = data.get('selling_price')
         if 'photos' in data:
             dish.photos = json.dumps(data['photos'])
 
@@ -1304,6 +1320,13 @@ def _recalc_menu_cost(menu, db):
             total += item.cost or 0
     menu.total_cost = round(total, 2)
     menu.cost_per_menu = round(total, 2)  # Already per 1 menu
+    # Food cost % and margin
+    if menu.selling_price and menu.selling_price > 0:
+        menu.food_cost_pct = round((menu.cost_per_menu / menu.selling_price) * 100, 1)
+        menu.margin = round(menu.selling_price - menu.cost_per_menu, 2)
+    else:
+        menu.food_cost_pct = None
+        menu.margin = None
 
 
 @inventory_bp.route('/api/menus', methods=['GET'])
@@ -1320,6 +1343,9 @@ def get_menus():
             'added_by': m.added_by,
             'total_cost': m.total_cost,
             'cost_per_menu': m.cost_per_menu,
+            'selling_price': m.selling_price,
+            'food_cost_pct': m.food_cost_pct,
+            'margin': m.margin,
             'section_count': len(m.sections),
             'photos': json.loads(m.photos) if m.photos else [],
             'created_at': m.created_at.isoformat() if m.created_at else None,
@@ -1345,6 +1371,9 @@ def get_menu(menu_id):
             'added_by': m.added_by,
             'total_cost': m.total_cost,
             'cost_per_menu': m.cost_per_menu,
+            'selling_price': m.selling_price,
+            'food_cost_pct': m.food_cost_pct,
+            'margin': m.margin,
             'photos': json.loads(m.photos) if m.photos else [],
             'created_at': m.created_at.isoformat() if m.created_at else None,
             'updated_at': m.updated_at.isoformat() if m.updated_at else None,
@@ -1382,6 +1411,7 @@ def create_menu():
             menu_type=menu_type,
             description=data.get('description'),
             added_by=data.get('added_by'),
+            selling_price=data.get('selling_price'),
             photos=json.dumps(data.get('photos', [])),
         )
         db.add(menu)
@@ -1459,6 +1489,8 @@ def update_menu(menu_id):
         menu.name = data.get('name', menu.name)
         menu.description = data.get('description', menu.description)
         menu.added_by = data.get('added_by', menu.added_by)
+        if 'selling_price' in data:
+            menu.selling_price = data.get('selling_price')
         if 'photos' in data:
             menu.photos = json.dumps(data['photos'])
 
@@ -1626,5 +1658,214 @@ def delete_section_item(menu_id, section_id, item_id):
         _recalc_menu_cost(menu, db)
         db.commit()
         return jsonify({'status': 'deleted', 'menu_total_cost': menu.total_cost})
+    finally:
+        db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  FOOD COST & MARGIN — pricing calculator + economy overview
+# ══════════════════════════════════════════════════════════════════════
+
+@inventory_bp.route('/api/pricing/calculate', methods=['POST'])
+def calculate_pricing():
+    """
+    Two-way pricing calculator.
+    Mode 1: Given selling_price → returns food_cost_pct and margin
+    Mode 2: Given target_food_cost_pct → returns required selling_price and margin
+
+    Body: {
+      "cost": 85.0,           # cost per serving (required)
+      "selling_price": 350,   # option 1: you set the price
+      "target_food_cost_pct": 30  # option 2: you set the target %
+    }
+    """
+    data = request.json
+    cost = data.get('cost')
+    if not cost or cost <= 0:
+        return jsonify({'error': 'Cost is required and must be > 0'}), 400
+
+    selling_price = data.get('selling_price')
+    target_pct = data.get('target_food_cost_pct')
+
+    if selling_price and selling_price > 0:
+        # Mode 1: price → food cost %
+        food_cost_pct = round((cost / selling_price) * 100, 1)
+        margin = round(selling_price - cost, 2)
+        return jsonify({
+            'mode': 'from_selling_price',
+            'cost': round(cost, 2),
+            'selling_price': round(selling_price, 2),
+            'food_cost_pct': food_cost_pct,
+            'margin': margin,
+            'margin_pct': round((margin / selling_price) * 100, 1),
+            'healthy': food_cost_pct <= 35,
+        })
+    elif target_pct and target_pct > 0:
+        # Mode 2: target % → required selling price
+        selling_price = round(cost / (target_pct / 100), 2)
+        margin = round(selling_price - cost, 2)
+        return jsonify({
+            'mode': 'from_target_food_cost',
+            'cost': round(cost, 2),
+            'selling_price': selling_price,
+            'food_cost_pct': target_pct,
+            'margin': margin,
+            'margin_pct': round((margin / selling_price) * 100, 1),
+            'healthy': target_pct <= 35,
+        })
+    else:
+        return jsonify({'error': 'Provide either selling_price or target_food_cost_pct'}), 400
+
+
+@inventory_bp.route('/api/pricing/set', methods=['POST'])
+def set_pricing():
+    """
+    Set selling price OR target food cost % on a dish or menu.
+    Body: {
+      "type": "dish" or "menu",
+      "id": 5,
+      "selling_price": 350,        # option 1
+      "target_food_cost_pct": 30   # option 2 — calculates selling price for you
+    }
+    """
+    db = Session()
+    try:
+        data = request.json
+        item_type = data.get('type')
+        item_id = data.get('id')
+
+        if item_type == 'dish':
+            item = db.query(Dish).get(int(item_id))
+            cost = item.cost_per_serving if item else None
+        elif item_type == 'menu':
+            item = db.query(Menu).get(int(item_id))
+            cost = item.cost_per_menu if item else None
+        else:
+            return jsonify({'error': 'type must be "dish" or "menu"'}), 400
+
+        if not item:
+            return jsonify({'error': f'{item_type} not found'}), 404
+        if not cost or cost <= 0:
+            return jsonify({'error': f'{item_type} has no cost calculated yet'}), 400
+
+        selling_price = data.get('selling_price')
+        target_pct = data.get('target_food_cost_pct')
+
+        if selling_price and selling_price > 0:
+            item.selling_price = round(float(selling_price), 2)
+        elif target_pct and target_pct > 0:
+            item.selling_price = round(cost / (float(target_pct) / 100), 2)
+        else:
+            return jsonify({'error': 'Provide selling_price or target_food_cost_pct'}), 400
+
+        # Recalculate food cost % and margin
+        item.food_cost_pct = round((cost / item.selling_price) * 100, 1)
+        item.margin = round(item.selling_price - cost, 2)
+        item.updated_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({
+            'id': item.id,
+            'type': item_type,
+            'cost': round(cost, 2),
+            'selling_price': item.selling_price,
+            'food_cost_pct': item.food_cost_pct,
+            'margin': item.margin,
+            'margin_pct': round((item.margin / item.selling_price) * 100, 1),
+            'healthy': item.food_cost_pct <= 35,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/economy/margins', methods=['GET'])
+def economy_margins():
+    """
+    Economy dashboard — margin overview for all dishes and menus.
+    Returns everything sorted by food cost % (worst first).
+    """
+    db = Session()
+    try:
+        dishes = db.query(Dish).all()
+        menus = db.query(Menu).all()
+
+        items = []
+        total_healthy = 0
+        total_warning = 0
+        total_danger = 0
+        total_no_price = 0
+
+        for d in dishes:
+            entry = {
+                'type': 'dish',
+                'id': d.id,
+                'name': d.name,
+                'cost': d.cost_per_serving,
+                'selling_price': d.selling_price,
+                'food_cost_pct': d.food_cost_pct,
+                'margin': d.margin,
+                'status': 'no_price',
+            }
+            if d.food_cost_pct is not None:
+                if d.food_cost_pct <= 30:
+                    entry['status'] = 'healthy'
+                    total_healthy += 1
+                elif d.food_cost_pct <= 35:
+                    entry['status'] = 'warning'
+                    total_warning += 1
+                else:
+                    entry['status'] = 'danger'
+                    total_danger += 1
+            else:
+                total_no_price += 1
+            items.append(entry)
+
+        for m in menus:
+            entry = {
+                'type': 'menu',
+                'id': m.id,
+                'name': m.name,
+                'menu_type': m.menu_type,
+                'cost': m.cost_per_menu,
+                'selling_price': m.selling_price,
+                'food_cost_pct': m.food_cost_pct,
+                'margin': m.margin,
+                'status': 'no_price',
+            }
+            if m.food_cost_pct is not None:
+                if m.food_cost_pct <= 30:
+                    entry['status'] = 'healthy'
+                    total_healthy += 1
+                elif m.food_cost_pct <= 35:
+                    entry['status'] = 'warning'
+                    total_warning += 1
+                else:
+                    entry['status'] = 'danger'
+                    total_danger += 1
+            else:
+                total_no_price += 1
+            items.append(entry)
+
+        # Sort: danger first, then warning, then healthy, then no_price
+        status_order = {'danger': 0, 'warning': 1, 'healthy': 2, 'no_price': 3}
+        items.sort(key=lambda x: (status_order.get(x['status'], 9), -(x['food_cost_pct'] or 0)))
+
+        return jsonify({
+            'items': items,
+            'summary': {
+                'total': len(items),
+                'healthy': total_healthy,
+                'warning': total_warning,
+                'danger': total_danger,
+                'no_price': total_no_price,
+            },
+            'thresholds': {
+                'healthy_max': 30,
+                'warning_max': 35,
+            }
+        })
     finally:
         db.close()
