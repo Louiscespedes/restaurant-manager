@@ -6,11 +6,11 @@ from flask import Blueprint, jsonify, request
 from datetime import datetime
 from models import (
     Session, InventorySession, InventoryItem, ReviewQuestion,
-    Product, Supplier, Recipe, RecipeIngredient,
+    Product, Supplier, Recipe, RecipeIngredient, RecipeReviewQuestion,
     Dish, DishRecipe, DishIngredient,
     Menu, MenuSection, MenuSectionItem
 )
-from ai_parser import parse_inventory_with_ai, generate_smart_questions, parse_recipe_text_with_ai
+from ai_parser import parse_inventory_with_ai, generate_smart_questions, parse_recipe_text_with_ai, match_recipe_prices_with_ai
 
 inventory_bp = Blueprint('inventory', __name__)
 
@@ -713,6 +713,9 @@ def get_recipes():
             'total_cost': r.total_cost,
             'cost_per_unit': r.cost_per_unit,
             'seasoning_pct': r.seasoning_pct,
+            'selling_price': r.selling_price,
+            'food_cost_pct': r.food_cost_pct,
+            'price_review_status': r.price_review_status,
             'photos': json.loads(r.photos) if r.photos else [],
             'ingredient_count': len(r.ingredients),
             'created_at': r.created_at.isoformat() if r.created_at else None,
@@ -744,14 +747,21 @@ def get_recipe_detail(recipe_id):
             'photos': json.loads(recipe.photos) if recipe.photos else [],
             'created_at': recipe.created_at.isoformat() if recipe.created_at else None,
             'updated_at': recipe.updated_at.isoformat() if recipe.updated_at else None,
+            'selling_price': recipe.selling_price,
+            'food_cost_pct': recipe.food_cost_pct,
+            'price_review_status': recipe.price_review_status,
             'ingredients': [{
                 'id': ing.id,
                 'name': ing.name,
                 'quantity': ing.quantity,
                 'unit': ing.unit,
+                'price_per_unit': ing.price_per_unit,
+                'price_unit': ing.price_unit,
+                'price_source': ing.price_source,
                 'cost': ing.cost,
                 'trimming_pct': ing.trimming_pct,
                 'adjusted_cost': ing.adjusted_cost,
+                'needs_review': ing.needs_review,
                 'notes': ing.notes
             } for ing in recipe.ingredients]
         })
@@ -906,6 +916,387 @@ def delete_recipe(recipe_id):
         return jsonify({'status': 'deleted'})
     finally:
         db.close()
+
+
+# ── Recipe Price Review ────────────────────────────────────────────────
+
+@inventory_bp.route('/api/recipes/<int:recipe_id>/match-prices', methods=['POST'])
+def match_recipe_prices(recipe_id):
+    """
+    After a recipe is created/parsed, run AI price matching on its ingredients.
+    Cross-references with Products table, generates review questions for ambiguous cases.
+    """
+    db = Session()
+    try:
+        recipe = db.query(Recipe).get(recipe_id)
+        if not recipe:
+            return jsonify({'error': 'Recipe not found'}), 404
+
+        # Build ingredient list for AI matching
+        ingredients_for_ai = []
+        for ing in recipe.ingredients:
+            ingredients_for_ai.append({
+                'name': ing.name,
+                'quantity': ing.quantity,
+                'unit': ing.unit,
+                'notes': ing.notes,
+            })
+
+        if not ingredients_for_ai:
+            return jsonify({'error': 'Recipe has no ingredients'}), 400
+
+        # Run AI price matching
+        result = match_recipe_prices_with_ai(ingredients_for_ai, db)
+        if not result:
+            return jsonify({'error': 'Price matching failed'}), 500
+
+        # Clear old review questions for this recipe
+        db.query(RecipeReviewQuestion).filter_by(recipe_id=recipe_id).delete()
+
+        # Process matches — auto-assign confident ones, flag the rest
+        ingredients_list = list(recipe.ingredients)
+        matched_count = 0
+        question_count = 0
+
+        for match in result.get('matches', []):
+            idx = match.get('ingredient_index', 0)
+            if idx >= len(ingredients_list):
+                continue
+            ing = ingredients_list[idx]
+
+            if match.get('status') == 'matched' and match.get('product_id'):
+                # Auto-assign: confident match found
+                ing.product_id = match['product_id']
+                ing.price_per_unit = match.get('price_per_unit')
+                ing.price_unit = match.get('price_unit')
+                ing.price_source = 'invoice'
+                ing.needs_review = False
+
+                # Calculate cost with unit conversion
+                calc_cost = match.get('calculated_cost')
+                if calc_cost:
+                    ing.cost = round(calc_cost, 2)
+                elif ing.price_per_unit and ing.quantity:
+                    ing.cost = round(ing.price_per_unit * ing.quantity, 2)
+
+                # Apply trimming
+                if ing.trimming_pct and ing.trimming_pct > 0 and ing.cost:
+                    ing.adjusted_cost = round(ing.cost / (1 - ing.trimming_pct / 100), 2)
+                else:
+                    ing.adjusted_cost = ing.cost
+
+                matched_count += 1
+            else:
+                # Needs review: multiple matches, no match, or unit mismatch
+                ing.needs_review = True
+
+        # Create review questions
+        for q_data in result.get('questions', []):
+            idx = q_data.get('ingredient_index', 0)
+            ing_id = ingredients_list[idx].id if idx < len(ingredients_list) else None
+
+            q = RecipeReviewQuestion(
+                recipe_id=recipe_id,
+                ingredient_id=ing_id,
+                question_type=q_data.get('question_type', 'missing_price'),
+                question_text=q_data.get('question_text', ''),
+                options=json.dumps(q_data.get('options', []), ensure_ascii=False),
+                order=question_count,
+            )
+            db.add(q)
+            question_count += 1
+
+        # Update recipe status
+        recipe.price_review_status = 'reviewing' if question_count > 0 else 'completed'
+
+        # Recalculate recipe total cost from matched ingredients
+        _recalc_recipe_cost(recipe)
+
+        db.commit()
+
+        return jsonify({
+            'recipe_id': recipe.id,
+            'matched': matched_count,
+            'needs_review': question_count,
+            'total_ingredients': len(ingredients_list),
+            'review_status': recipe.price_review_status,
+            'total_cost': recipe.total_cost,
+            'cost_per_unit': recipe.cost_per_unit,
+        })
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/recipes/<int:recipe_id>/review', methods=['GET'])
+def get_recipe_review(recipe_id):
+    """Get all review questions for a recipe's pricing."""
+    db = Session()
+    try:
+        recipe = db.query(Recipe).get(recipe_id)
+        if not recipe:
+            return jsonify({'error': 'Recipe not found'}), 404
+
+        questions = db.query(RecipeReviewQuestion).filter_by(
+            recipe_id=recipe_id
+        ).order_by(RecipeReviewQuestion.order).all()
+
+        # Also return ingredients with their current pricing status
+        ingredients_status = []
+        for ing in recipe.ingredients:
+            ingredients_status.append({
+                'id': ing.id,
+                'name': ing.name,
+                'quantity': ing.quantity,
+                'unit': ing.unit,
+                'product_id': ing.product_id,
+                'price_per_unit': ing.price_per_unit,
+                'price_unit': ing.price_unit,
+                'price_source': ing.price_source,
+                'cost': ing.cost,
+                'adjusted_cost': ing.adjusted_cost,
+                'needs_review': ing.needs_review,
+                'trimming_pct': ing.trimming_pct,
+            })
+
+        return jsonify({
+            'recipe_id': recipe.id,
+            'recipe_name': recipe.name,
+            'review_status': recipe.price_review_status,
+            'total_cost': recipe.total_cost,
+            'cost_per_unit': recipe.cost_per_unit,
+            'ingredients': ingredients_status,
+            'questions': [{
+                'id': q.id,
+                'ingredient_id': q.ingredient_id,
+                'question_type': q.question_type,
+                'question_text': q.question_text,
+                'options': json.loads(q.options) if q.options else [],
+                'answer': q.answer,
+                'is_answered': q.is_answered,
+            } for q in questions],
+        })
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/recipes/<int:recipe_id>/review/answer', methods=['POST'])
+def answer_recipe_review(recipe_id):
+    """
+    Answer a recipe review question.
+    Body: { "question_id": 5, "answer": "12" }
+    For price_match: answer is product_id or "manual"
+    For missing_price: answer is "manual" (then use /ingredient/:id/price to set it)
+    For unit_mismatch: answer is pieces_per_kg value or "manual"
+    """
+    db = Session()
+    try:
+        data = request.json
+        q_id = data.get('question_id')
+        answer = data.get('answer')
+
+        question = db.query(RecipeReviewQuestion).get(q_id)
+        if not question or question.recipe_id != recipe_id:
+            return jsonify({'error': 'Question not found'}), 404
+
+        question.answer = str(answer)
+        question.is_answered = True
+
+        # Apply the answer to the ingredient
+        if question.ingredient_id:
+            ing = db.query(RecipeIngredient).get(question.ingredient_id)
+            if ing:
+                if question.question_type == 'price_match' and answer != 'manual':
+                    # User selected a product
+                    try:
+                        product = db.query(Product).get(int(answer))
+                        if product:
+                            ing.product_id = product.id
+                            ing.price_per_unit = product.current_price
+                            ing.price_unit = product.unit
+                            ing.price_source = 'invoice'
+                            ing.needs_review = False
+                            # Calculate cost
+                            _calc_ingredient_cost(ing)
+                    except (ValueError, TypeError):
+                        pass
+
+                elif question.question_type == 'unit_mismatch' and answer != 'manual':
+                    # User provided pieces_per_kg
+                    try:
+                        pieces_per_kg = float(answer)
+                        if ing.price_per_unit and ing.quantity and pieces_per_kg > 0:
+                            # price is per kg, convert to per piece
+                            price_per_piece = ing.price_per_unit / pieces_per_kg
+                            ing.cost = round(price_per_piece * ing.quantity, 2)
+                            ing.price_source = 'invoice'
+                            ing.needs_review = False
+                            if ing.trimming_pct and ing.trimming_pct > 0:
+                                ing.adjusted_cost = round(ing.cost / (1 - ing.trimming_pct / 100), 2)
+                            else:
+                                ing.adjusted_cost = ing.cost
+                    except (ValueError, TypeError):
+                        pass
+
+                elif answer == 'manual':
+                    # User will manually enter the price
+                    ing.needs_review = True
+                    ing.price_source = None  # Will be set to 'manual' when they enter it
+
+        # Check if all questions are answered
+        recipe = db.query(Recipe).get(recipe_id)
+        remaining = db.query(RecipeReviewQuestion).filter_by(
+            recipe_id=recipe_id, is_answered=False
+        ).count()
+
+        if remaining == 0:
+            # Check if any ingredients still need manual pricing
+            needs_manual = db.query(RecipeIngredient).filter_by(
+                recipe_id=recipe_id, needs_review=True
+            ).count()
+            if needs_manual == 0:
+                recipe.price_review_status = 'completed'
+
+        # Recalculate recipe cost
+        _recalc_recipe_cost(recipe)
+        db.commit()
+
+        return jsonify({
+            'status': 'answered',
+            'remaining_questions': remaining,
+            'review_status': recipe.price_review_status,
+            'total_cost': recipe.total_cost,
+            'cost_per_unit': recipe.cost_per_unit,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/recipes/ingredient/<int:ingredient_id>/price', methods=['PUT'])
+def set_ingredient_price(ingredient_id):
+    """
+    Manually set or override the price on a recipe ingredient.
+    Body: {
+      "price_per_unit": 285.0,
+      "price_unit": "kg",         # optional, defaults to ingredient's unit
+      "trimming_pct": 15,         # optional
+      "product_id": null           # optional, link to product
+    }
+    """
+    db = Session()
+    try:
+        ing = db.query(RecipeIngredient).get(ingredient_id)
+        if not ing:
+            return jsonify({'error': 'Ingredient not found'}), 404
+
+        data = request.json
+        ing.price_per_unit = data.get('price_per_unit', ing.price_per_unit)
+        ing.price_unit = data.get('price_unit', ing.price_unit or ing.unit)
+        ing.price_source = 'manual'
+        ing.needs_review = False
+
+        if 'trimming_pct' in data:
+            ing.trimming_pct = data['trimming_pct'] or 0
+        if 'product_id' in data:
+            ing.product_id = data['product_id']
+
+        # Calculate cost
+        _calc_ingredient_cost(ing)
+
+        # Recalculate recipe total
+        recipe = db.query(Recipe).get(ing.recipe_id)
+        if recipe:
+            # Check if all ingredients now have prices
+            needs_review = db.query(RecipeIngredient).filter_by(
+                recipe_id=recipe.id, needs_review=True
+            ).count()
+            if needs_review == 0:
+                remaining_q = db.query(RecipeReviewQuestion).filter_by(
+                    recipe_id=recipe.id, is_answered=False
+                ).count()
+                if remaining_q == 0:
+                    recipe.price_review_status = 'completed'
+            _recalc_recipe_cost(recipe)
+
+        db.commit()
+
+        return jsonify({
+            'ingredient_id': ing.id,
+            'name': ing.name,
+            'price_per_unit': ing.price_per_unit,
+            'price_unit': ing.price_unit,
+            'price_source': ing.price_source,
+            'cost': ing.cost,
+            'adjusted_cost': ing.adjusted_cost,
+            'recipe_total_cost': recipe.total_cost if recipe else None,
+            'recipe_cost_per_unit': recipe.cost_per_unit if recipe else None,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+def _calc_ingredient_cost(ing):
+    """Calculate ingredient cost with unit conversion and trimming."""
+    if not ing.price_per_unit or not ing.quantity:
+        return
+
+    price = ing.price_per_unit
+    qty = ing.quantity
+    recipe_unit = (ing.unit or '').lower()
+    price_unit = (ing.price_unit or recipe_unit).lower()
+
+    # Unit conversion: recipe_unit → price_unit
+    converted_qty = qty
+    if recipe_unit != price_unit:
+        # Weight conversions
+        weight_to_kg = {'kg': 1, 'g': 0.001, 'hg': 0.1}
+        # Volume conversions
+        vol_to_l = {'l': 1, 'liter': 1, 'dl': 0.1, 'cl': 0.01, 'ml': 0.001, 'msk': 0.015, 'tsk': 0.005}
+
+        if recipe_unit in weight_to_kg and price_unit in weight_to_kg:
+            converted_qty = qty * weight_to_kg[recipe_unit] / weight_to_kg[price_unit]
+        elif recipe_unit in vol_to_l and price_unit in vol_to_l:
+            converted_qty = qty * vol_to_l[recipe_unit] / vol_to_l[price_unit]
+        elif recipe_unit in weight_to_kg and price_unit in vol_to_l:
+            # Rough approximation: 1 kg ≈ 1 liter (for water-based)
+            converted_qty = qty * weight_to_kg[recipe_unit] / vol_to_l[price_unit]
+        elif recipe_unit in vol_to_l and price_unit in weight_to_kg:
+            converted_qty = qty * vol_to_l[recipe_unit] / weight_to_kg[price_unit]
+
+    ing.cost = round(price * converted_qty, 2)
+
+    # Apply trimming
+    if ing.trimming_pct and ing.trimming_pct > 0:
+        ing.adjusted_cost = round(ing.cost / (1 - ing.trimming_pct / 100), 2)
+    else:
+        ing.adjusted_cost = ing.cost
+
+
+def _recalc_recipe_cost(recipe):
+    """Recalculate recipe total cost from all ingredients."""
+    ingredients_total = 0
+    for ing in recipe.ingredients:
+        ingredients_total += (ing.adjusted_cost or ing.cost or 0)
+
+    seasoning_pct = recipe.seasoning_pct or 0
+    seasoning_cost = round(ingredients_total * (seasoning_pct / 100), 2)
+    recipe.total_cost = round(ingredients_total + seasoning_cost, 2)
+
+    if recipe.total_yield and recipe.total_yield > 0:
+        recipe.cost_per_unit = round(recipe.total_cost / recipe.total_yield, 2)
+
+    # Update food cost % if selling price is set
+    if recipe.selling_price and recipe.selling_price > 0 and recipe.cost_per_unit:
+        recipe.food_cost_pct = round((recipe.cost_per_unit / recipe.selling_price) * 100, 1)
 
 
 # ── Export ─────────────────────────────────────────────────────────────
