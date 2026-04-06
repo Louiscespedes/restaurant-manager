@@ -206,6 +206,8 @@ class Recipe(Base):
     yield_unit = Column(String, nullable=True)  # e.g. 'liter', 'kg', 'portions'
     total_cost = Column(Float, nullable=True)  # sum of ingredient costs
     cost_per_unit = Column(Float, nullable=True)  # total_cost / total_yield
+    selling_price = Column(Float, nullable=True)  # If sold standalone (e.g. sauce, bread)
+    food_cost_pct = Column(Float, nullable=True)  # (cost_per_unit / selling_price) * 100
     seasoning_pct = Column(Float, default=0)  # seasoning cost as % of ingredients total
     notes = Column(Text, nullable=True)
     photos = Column(Text, nullable=True)  # JSON array of photo URLs
@@ -247,6 +249,9 @@ class Dish(Base):
     servings = Column(Float, default=1)  # How many portions this dish makes
     total_cost = Column(Float, nullable=True)  # Sum of all recipe costs + ingredient costs
     cost_per_serving = Column(Float, nullable=True)  # total_cost / servings
+    selling_price = Column(Float, nullable=True)  # What you charge the customer
+    food_cost_pct = Column(Float, nullable=True)  # (cost_per_serving / selling_price) * 100
+    margin = Column(Float, nullable=True)  # selling_price - cost_per_serving
     photos = Column(Text, nullable=True)  # JSON array of photo URLs
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -303,6 +308,9 @@ class Menu(Base):
     added_by = Column(String, nullable=True)
     total_cost = Column(Float, nullable=True)  # Sum of all section costs
     cost_per_menu = Column(Float, nullable=True)  # Total cost for 1 menu served
+    selling_price = Column(Float, nullable=True)  # Menu price charged to customer
+    food_cost_pct = Column(Float, nullable=True)  # (cost_per_menu / selling_price) * 100
+    margin = Column(Float, nullable=True)  # selling_price - cost_per_menu
     photos = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
