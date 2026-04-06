@@ -1,5 +1,6 @@
 """
-Restaurant Manager API — Flask backend deployed on Railway.
+M.E.P — Mise en Place
+Restaurant management API — Flask backend deployed on Railway.
 Connects to Fortnox for live invoice data, serves to Lovable frontend.
 """
 from flask import Flask, jsonify, request, redirect
@@ -15,13 +16,16 @@ from models import (
 from fortnox_client import FortnoxClient
 from sync_service import SyncService
 from inventory_routes import inventory_bp
+from upload_routes import upload_bp
 
 # ── App Setup ──────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
 CORS(app)  # Allow Lovable frontend to connect
 app.register_blueprint(inventory_bp)
+app.register_blueprint(upload_bp)
 
 # Create database tables on startup (MUST happen before FortnoxClient)
 init_db()
@@ -58,7 +62,7 @@ sync = SyncService(fortnox)
 def health():
     return jsonify({
         'status': 'running',
-        'app': 'Restaurant Manager API',
+        'app': 'M.E.P — Mise en Place',
         'fortnox_connected': fortnox.is_connected(),
         'timestamp': datetime.utcnow().isoformat()
     })
