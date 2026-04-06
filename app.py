@@ -26,6 +26,25 @@ app.register_blueprint(inventory_bp)
 # Create database tables on startup (MUST happen before FortnoxClient)
 init_db()
 
+# Run migrations for new columns (safe to re-run — uses IF NOT EXISTS)
+from models import engine as _engine
+_migration_sql = [
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS added_by TEXT",
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS seasoning_pct FLOAT DEFAULT 0",
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS photos TEXT",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS adjusted_cost FLOAT",
+    "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS notes TEXT",
+]
+try:
+    with _engine.connect() as _conn:
+        for _sql in _migration_sql:
+            _conn.execute(_sql)
+        _conn.commit()
+    print("DB migration: new columns added successfully")
+except Exception as _e:
+    print(f"DB migration note: {_e}")
+
 # Initialize Fortnox client
 fortnox = FortnoxClient(Session)
 sync = SyncService(fortnox)
