@@ -265,6 +265,220 @@ Return ONLY valid JSON in this exact format:
         return _parse_recipe_text_fallback(raw_text)
 
 
+def match_recipe_prices_with_ai(recipe_ingredients, db_session):
+    """
+    After a recipe is parsed, cross-reference each ingredient with the Products table.
+    Returns price matches + review questions for ambiguous/missing cases.
+
+    recipe_ingredients: list of dicts with {name, quantity, unit, ...}
+    """
+    if not client:
+        return _match_prices_fallback(recipe_ingredients, db_session)
+
+    # Build rich product context with prices, suppliers, and units
+    products = db_session.query(Product).all()
+    product_entries = []
+    for p in products:
+        entry = {
+            'id': p.id,
+            'name': p.name,
+            'unit': p.unit,
+            'price': p.current_price,
+            'category': p.category,
+            'supplier': p.supplier.name if p.supplier else None,
+        }
+        product_entries.append(entry)
+
+    products_json = json.dumps(product_entries, ensure_ascii=False, indent=2)
+    ingredients_json = json.dumps(recipe_ingredients, ensure_ascii=False, indent=2)
+
+    prompt = f"""You are an AI assistant for a Swedish fine-dining restaurant's recipe costing system.
+
+A chef has submitted a recipe. For each ingredient, find the best matching product from the database to assign a price.
+
+PRODUCTS IN DATABASE (from invoices):
+{products_json}
+
+RECIPE INGREDIENTS TO MATCH:
+{ingredients_json}
+
+YOUR TASK — for each ingredient, return one of these outcomes:
+
+1. **EXACT MATCH** — one product clearly matches → assign it
+2. **MULTIPLE MATCHES** — several products could match (e.g. "beef" could be entrecôte or fläskfilé) → list options, generate a question
+3. **NO MATCH** — nothing in the database matches → flag for manual price entry
+4. **UNIT MISMATCH** — product found but units don't align (recipe says "3 st" but product is priced per kg) → flag for conversion
+
+IMPORTANT RULES:
+- Match intelligently: "cream" = "grädde", "butter" = "smör", "olive oil" = "olivolja"
+- If the recipe says "200g butter" and the product is "Smör" at 89 SEK/kg, calculate the cost: 0.2 kg × 89 = 17.8 SEK
+- Common unit conversions:
+  - 1 kg = 1000 g
+  - 1 liter = 10 dl = 100 cl = 1000 ml
+  - 1 msk (tablespoon) ≈ 15 ml, 1 tsk (teaspoon) ≈ 5 ml
+  - For "st" (pieces) priced per kg: need pieces_per_kg info → flag as unit_mismatch
+- If quantity seems unreasonable for a restaurant recipe (e.g. 500 kg of saffron), flag it as quantity_check
+- Always think about what makes sense in a professional kitchen
+
+Return ONLY valid JSON:
+{{
+  "matches": [
+    {{
+      "ingredient_index": 0,
+      "ingredient_name": "Smör (Butter)",
+      "status": "matched",
+      "product_id": 12,
+      "product_name": "Smör",
+      "price_per_unit": 89.0,
+      "price_unit": "kg",
+      "recipe_quantity": 200,
+      "recipe_unit": "g",
+      "converted_quantity": 0.2,
+      "converted_unit": "kg",
+      "calculated_cost": 17.8,
+      "confidence": "high",
+      "notes": null
+    }},
+    {{
+      "ingredient_index": 1,
+      "ingredient_name": "Beef",
+      "status": "multiple_matches",
+      "candidates": [
+        {{ "product_id": 5, "name": "Entrecôte", "price": 285, "unit": "kg", "supplier": "Martin Olsson" }},
+        {{ "product_id": 8, "name": "Oxfilé", "price": 450, "unit": "kg", "supplier": "Scan" }}
+      ],
+      "confidence": "low",
+      "notes": "Multiple beef products found"
+    }},
+    {{
+      "ingredient_index": 2,
+      "ingredient_name": "Saffron",
+      "status": "no_match",
+      "confidence": "none",
+      "notes": "No saffron product found in database"
+    }},
+    {{
+      "ingredient_index": 3,
+      "ingredient_name": "Langoustine",
+      "status": "unit_mismatch",
+      "product_id": 15,
+      "product_name": "Havskräfta",
+      "price_per_unit": 380,
+      "price_unit": "kg",
+      "recipe_quantity": 3,
+      "recipe_unit": "st",
+      "confidence": "medium",
+      "notes": "Recipe uses pieces but product is priced per kg — need pieces_per_kg conversion"
+    }}
+  ],
+  "questions": [
+    {{
+      "ingredient_index": 1,
+      "question_type": "price_match",
+      "question_text": "Which beef product do you mean by 'Beef'?",
+      "options": [
+        {{ "value": "5", "label": "Entrecôte — 285 SEK/kg (Martin Olsson)" }},
+        {{ "value": "8", "label": "Oxfilé — 450 SEK/kg (Scan)" }},
+        {{ "value": "manual", "label": "None of these — I'll enter the price manually" }}
+      ]
+    }},
+    {{
+      "ingredient_index": 2,
+      "question_type": "missing_price",
+      "question_text": "I couldn't find 'Saffron' in your invoices. What's the price?",
+      "options": [
+        {{ "value": "manual", "label": "Enter price manually" }}
+      ]
+    }},
+    {{
+      "ingredient_index": 3,
+      "question_type": "unit_mismatch",
+      "question_text": "Recipe uses 3 st (pieces) of Langoustine, but it's priced at 380 SEK/kg. How many pieces per kg?",
+      "options": [
+        {{ "value": "5", "label": "~5 per kg (large)" }},
+        {{ "value": "7", "label": "~7 per kg (medium)" }},
+        {{ "value": "10", "label": "~10 per kg (small)" }},
+        {{ "value": "manual", "label": "Enter exact number" }}
+      ]
+    }}
+  ]
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = response.content[0].text
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+
+        return json.loads(response_text.strip())
+
+    except Exception as e:
+        print(f"AI price matching error: {e}")
+        return _match_prices_fallback(recipe_ingredients, db_session)
+
+
+def _match_prices_fallback(recipe_ingredients, db_session):
+    """Simple name-matching fallback when AI is unavailable."""
+    products = db_session.query(Product).all()
+    matches = []
+    questions = []
+
+    for i, ing in enumerate(recipe_ingredients):
+        name = (ing.get('name') or '').lower()
+        found = []
+        for p in products:
+            if p.name and (p.name.lower() in name or name in p.name.lower()):
+                found.append(p)
+
+        if len(found) == 1:
+            p = found[0]
+            matches.append({
+                'ingredient_index': i,
+                'ingredient_name': ing.get('name'),
+                'status': 'matched',
+                'product_id': p.id,
+                'product_name': p.name,
+                'price_per_unit': p.current_price,
+                'price_unit': p.unit,
+                'confidence': 'medium',
+            })
+        elif len(found) > 1:
+            matches.append({
+                'ingredient_index': i,
+                'ingredient_name': ing.get('name'),
+                'status': 'multiple_matches',
+                'candidates': [{'product_id': p.id, 'name': p.name, 'price': p.current_price, 'unit': p.unit} for p in found],
+            })
+            questions.append({
+                'ingredient_index': i,
+                'question_type': 'price_match',
+                'question_text': f"Which product do you mean by '{ing.get('name')}'?",
+                'options': [{'value': str(p.id), 'label': f"{p.name} — {p.current_price} SEK/{p.unit}"} for p in found]
+                           + [{'value': 'manual', 'label': "None — enter price manually"}],
+            })
+        else:
+            matches.append({
+                'ingredient_index': i,
+                'ingredient_name': ing.get('name'),
+                'status': 'no_match',
+            })
+            questions.append({
+                'ingredient_index': i,
+                'question_type': 'missing_price',
+                'question_text': f"No price found for '{ing.get('name')}'. What's the price?",
+                'options': [{'value': 'manual', 'label': 'Enter price manually'}],
+            })
+
+    return {'matches': matches, 'questions': questions}
+
+
 def _parse_recipe_text_fallback(raw_text):
     """Simple regex fallback for recipe parsing when AI is unavailable."""
     import re
