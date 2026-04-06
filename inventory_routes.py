@@ -9,12 +9,12 @@ from models import (
     Product, Supplier, Recipe, RecipeIngredient
 )
 from ai_parser import parse_inventory_with_ai, generate_smart_questions, parse_recipe_text_with_ai
- 
+
 inventory_bp = Blueprint('inventory', __name__)
- 
- 
+
+
 # ── Browse Inventories ─────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/years', methods=['GET'])
 def get_inventory_years():
     """Get all years that have inventory data."""
@@ -26,8 +26,8 @@ def get_inventory_years():
         return jsonify([y[0] for y in years])
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/inventory/<int:year>', methods=['GET'])
 def get_inventory_months(year):
     """Get all months with inventory for a given year."""
@@ -44,8 +44,8 @@ def get_inventory_months(year):
         } for s in sessions])
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/inventory/<int:year>/<int:month>', methods=['GET'])
 def get_inventory(year, month):
     """Get full inventory for a specific month."""
@@ -54,26 +54,26 @@ def get_inventory(year, month):
         session = db.query(InventorySession).filter_by(
             year=year, month=month, status='confirmed'
         ).first()
- 
+
         if not session:
             return jsonify({'error': 'No inventory found for this month', 'items': []}), 404
- 
+
         # Optional filters
         category = request.args.get('category')
         supplier = request.args.get('supplier')
         search = request.args.get('search')
- 
+
         items_query = db.query(InventoryItem).filter_by(session_id=session.id)
- 
+
         if category:
             items_query = items_query.filter(InventoryItem.category == category)
         if supplier:
             items_query = items_query.filter(InventoryItem.supplier_name.ilike(f'%{supplier}%'))
         if search:
             items_query = items_query.filter(InventoryItem.name.ilike(f'%{search}%'))
- 
+
         items = items_query.order_by(InventoryItem.category, InventoryItem.name).all()
- 
+
         return jsonify({
             'session_id': session.id,
             'year': session.year,
@@ -98,8 +98,8 @@ def get_inventory(year, month):
         })
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/inventory/categories', methods=['GET'])
 def get_categories():
     """Get all product categories."""
@@ -108,8 +108,8 @@ def get_categories():
         'Fruit', 'Dry Goods', 'Oils & Condiments', 'Beverages',
         'Frozen', 'Bakery', 'Finished Products', 'Other'
     ])
- 
- 
+
+
 @inventory_bp.route('/api/inventory/session/<int:session_id>', methods=['GET'])
 def get_inventory_session(session_id):
     """Get a session with all its items — used by confirm page."""
@@ -118,7 +118,7 @@ def get_inventory_session(session_id):
         session = db.query(InventorySession).get(session_id)
         if not session:
             return jsonify({'error': 'Session not found'}), 404
- 
+
         return jsonify({
             'session_id': session.id,
             'year': session.year,
@@ -143,10 +143,10 @@ def get_inventory_session(session_id):
         })
     finally:
         db.close()
- 
- 
+
+
 # ── Edit Inventory Item ────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/item/<int:item_id>', methods=['PUT'])
 def update_inventory_item(item_id):
     """Edit a single inventory item."""
@@ -155,7 +155,7 @@ def update_inventory_item(item_id):
         item = db.query(InventoryItem).get(item_id)
         if not item:
             return jsonify({'error': 'Item not found'}), 404
- 
+
         data = request.json
         if 'name' in data:
             item.name = data['name']
@@ -173,32 +173,32 @@ def update_inventory_item(item_id):
             item.trimming_loss_pct = data['trimming_loss_pct']
         if 'notes' in data:
             item.notes = data['notes']
- 
+
         # Recalculate adjusted price and value
         if item.price_per_unit and item.trimming_loss_pct:
             item.adjusted_price = item.price_per_unit / (1 - item.trimming_loss_pct / 100)
         else:
             item.adjusted_price = item.price_per_unit
- 
+
         price = item.adjusted_price or item.price_per_unit or 0
         item.value = price * (item.quantity or 0)
- 
+
         db.commit()
- 
+
         # Recalculate session total
         session = db.query(InventorySession).get(item.session_id)
         if session:
             total = sum(i.value or 0 for i in session.items)
             session.total_value = round(total, 2)
             db.commit()
- 
+
         return jsonify({'status': 'updated', 'item_id': item.id, 'new_value': item.value})
     finally:
         db.close()
- 
- 
+
+
 # ── Process Text / Voice Input ─────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/process-text', methods=['POST'])
 def process_inventory_text():
     """
@@ -212,10 +212,10 @@ def process_inventory_text():
         raw_text = data.get('text', '')
         year = data.get('year', datetime.utcnow().year)
         month = data.get('month', datetime.utcnow().month)
- 
+
         if not raw_text.strip():
             return jsonify({'error': 'No text provided'}), 400
- 
+
         # Create inventory session
         session = InventorySession(
             year=year,
@@ -225,21 +225,21 @@ def process_inventory_text():
         )
         db.add(session)
         db.flush()
- 
+
         # Try AI parsing first, fall back to regex
         ai_result = parse_inventory_with_ai(raw_text, db)
- 
+
         if ai_result and 'items' in ai_result:
             # AI parsed successfully — convert to InventoryItem objects
             items = _create_items_from_ai(ai_result['items'], session.id, db)
         else:
             # Fallback to regex parser
             items = _parse_inventory_text(raw_text, session.id, db)
- 
+
         for item in items:
             db.add(item)
         db.flush()  # Get item IDs before generating questions
- 
+
         # Generate review questions (AI-powered if available)
         if ai_result and 'items' in ai_result:
             ai_questions = generate_smart_questions(ai_result['items'], None, db)
@@ -249,13 +249,13 @@ def process_inventory_text():
                 questions = _generate_review_questions(items, session.id, db)
         else:
             questions = _generate_review_questions(items, session.id, db)
- 
+
         for q in questions:
             db.add(q)
- 
+
         session.status = 'reviewing'
         db.commit()
- 
+
         return jsonify({
             'session_id': session.id,
             'items_parsed': len(items),
@@ -267,8 +267,8 @@ def process_inventory_text():
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
- 
- 
+
+
 def _create_items_from_ai(ai_items, session_id, db):
     """Convert AI-parsed items into InventoryItem objects."""
     items = []
@@ -284,7 +284,7 @@ def _create_items_from_ai(ai_items, session_id, db):
             supplier_name=ai_item.get('supplier_name'),
             notes=ai_item.get('notes')
         )
- 
+
         # Link to matched product if AI found one
         matched_id = ai_item.get('matched_product_id')
         if matched_id:
@@ -293,22 +293,22 @@ def _create_items_from_ai(ai_items, session_id, db):
                 item.product_id = product.id
                 if not item.price_per_unit and product.current_price:
                     item.price_per_unit = product.current_price
- 
+
         # Calculate value
         if item.price_per_unit and item.quantity:
             item.value = round(item.price_per_unit * item.quantity, 2)
- 
+
         items.append(item)
     return items
- 
- 
+
+
 def _create_questions_from_ai(ai_questions, items, session_id):
     """Convert AI-generated questions into ReviewQuestion objects."""
     questions = []
     for i, aq in enumerate(ai_questions):
         item_index = aq.get('item_index', 0)
         item = items[item_index] if item_index < len(items) else None
- 
+
         q = ReviewQuestion(
             session_id=session_id,
             item_id=item.id if item else None,
@@ -319,8 +319,8 @@ def _create_questions_from_ai(ai_questions, items, session_id):
         )
         questions.append(q)
     return questions
- 
- 
+
+
 def _parse_inventory_text(raw_text, session_id, db):
     """
     Parse messy inventory text into structured items.
@@ -333,21 +333,21 @@ def _parse_inventory_text(raw_text, session_id, db):
     import re
     items = []
     lines = raw_text.strip().split('\n')
- 
+
     for line in lines:
         line = line.strip()
         if not line or len(line) < 2:
             continue
- 
+
         # Clean up common separators
         line = line.replace(',', '\n').replace(';', '\n')
         sub_items = line.split('\n')
- 
+
         for sub in sub_items:
             sub = sub.strip()
             if not sub or len(sub) < 2:
                 continue
- 
+
             item = InventoryItem(
                 session_id=session_id,
                 raw_name=sub,
@@ -356,7 +356,7 @@ def _parse_inventory_text(raw_text, session_id, db):
                 unit=None,
                 price_per_unit=None
             )
- 
+
             # Try to extract quantity + unit (e.g. "10kg", "3 bottles", "25 kg")
             qty_match = re.search(r'(\d+[.,]?\d*)\s*(kg|g|st|liter|l|flaskor?|bottles?|burkar?|paket|pkt|förp)', sub, re.IGNORECASE)
             if qty_match:
@@ -368,19 +368,19 @@ def _parse_inventory_text(raw_text, session_id, db):
                     'burk': 'st', 'burkar': 'st', 'paket': 'st', 'pkt': 'st', 'förp': 'st'
                 }
                 item.unit = unit_map.get(unit_raw, unit_raw)
- 
+
             # Try to extract price (e.g. "450kr/kg", "200kr", "150 kr")
             price_match = re.search(r'(\d+[.,]?\d*)\s*kr', sub, re.IGNORECASE)
             if price_match:
                 item.price_per_unit = float(price_match.group(1).replace(',', '.'))
- 
+
             # Try to match to existing products
             # Clean the name for matching (remove qty, price, etc.)
             clean_name = re.sub(r'\d+[.,]?\d*\s*(kg|g|st|liter|l|kr|sek|flaskor?|bottles?)\S*', '', sub, flags=re.IGNORECASE).strip()
             clean_name = re.sub(r'\s+', ' ', clean_name).strip(' ,-/')
             if clean_name:
                 item.name = clean_name
- 
+
             # Try matching to known products
             matches = db.query(Product).filter(
                 Product.name.ilike(f'%{clean_name}%')
@@ -391,28 +391,28 @@ def _parse_inventory_text(raw_text, session_id, db):
                 item.supplier_name = matches[0].supplier.name if matches[0].supplier else None
                 if not item.price_per_unit and matches[0].current_price:
                     item.price_per_unit = matches[0].current_price
- 
+
             # Calculate value if we have price and quantity
             if item.price_per_unit and item.quantity:
                 item.value = round(item.price_per_unit * item.quantity, 2)
- 
+
             items.append(item)
- 
+
     return items
- 
- 
+
+
 def _generate_review_questions(items, session_id, db):
     """Generate AI review questions for ambiguous items."""
     questions = []
     order = 0
- 
+
     for item in items:
         # 1. Product disambiguation — multiple matches
         if item.name:
             matches = db.query(Product).filter(
                 Product.name.ilike(f'%{item.name}%')
             ).all()
- 
+
             if len(matches) > 1:
                 options = []
                 for m in matches:
@@ -420,7 +420,7 @@ def _generate_review_questions(items, session_id, db):
                     if m.supplier:
                         label += f' — {m.supplier.name}'
                     options.append({'id': m.id, 'label': label})
- 
+
                 q = ReviewQuestion(
                     session_id=session_id,
                     item_id=item.id if item.id else None,
@@ -431,7 +431,7 @@ def _generate_review_questions(items, session_id, db):
                 )
                 questions.append(q)
                 order += 1
- 
+
         # 2. Trimming loss — keywords
         raw = (item.raw_name or '').lower()
         if any(word in raw for word in ['trimmed', 'rensad', 'filead', 'putsad', 'skuren']):
@@ -451,14 +451,14 @@ def _generate_review_questions(items, session_id, db):
             )
             questions.append(q)
             order += 1
- 
+
         # 3. Recipe product — keywords
         if any(word in raw for word in ['finished', 'färdig', 'prepared', 'homemade', 'hemlagad']):
             # Check if we have a matching recipe
             recipe_matches = db.query(Recipe).filter(
                 Recipe.name.ilike(f'%{item.name}%')
             ).all()
- 
+
             if recipe_matches:
                 recipe = recipe_matches[0]
                 q = ReviewQuestion(
@@ -476,7 +476,7 @@ def _generate_review_questions(items, session_id, db):
                 )
                 questions.append(q)
                 order += 1
- 
+
         # 4. Missing price
         if not item.price_per_unit and item.quantity:
             q = ReviewQuestion(
@@ -489,12 +489,12 @@ def _generate_review_questions(items, session_id, db):
             )
             questions.append(q)
             order += 1
- 
+
     return questions
- 
- 
+
+
 # ── Review Questions ───────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/review/<int:session_id>', methods=['GET'])
 def get_review_questions(session_id):
     """Get all review questions for a session."""
@@ -503,13 +503,13 @@ def get_review_questions(session_id):
         session = db.query(InventorySession).get(session_id)
         if not session:
             return jsonify({'error': 'Session not found'}), 404
- 
+
         questions = db.query(ReviewQuestion).filter_by(
             session_id=session_id
         ).order_by(ReviewQuestion.order).all()
- 
+
         answered = sum(1 for q in questions if q.is_answered)
- 
+
         return jsonify({
             'session_id': session_id,
             'total_questions': len(questions),
@@ -526,8 +526,8 @@ def get_review_questions(session_id):
         })
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/inventory/review/<int:session_id>/answer', methods=['POST'])
 def answer_review_question(session_id):
     """Submit an answer to a review question."""
@@ -536,20 +536,35 @@ def answer_review_question(session_id):
         data = request.json
         question_id = data.get('question_id')
         answer = data.get('answer')
- 
+
         question = db.query(ReviewQuestion).get(question_id)
         if not question or question.session_id != session_id:
             return jsonify({'error': 'Question not found'}), 404
- 
+
         question.answer = json.dumps(answer) if isinstance(answer, dict) else str(answer)
         question.is_answered = True
- 
+
         # Apply the answer to the inventory item
         item = db.query(InventoryItem).get(question.item_id) if question.item_id else None
- 
+
         if item and question.question_type == 'product_match':
-            # Link to selected product
-            product = db.query(Product).get(int(answer))
+            # Link to selected product — answer can be product id OR label text
+            product = None
+            try:
+                product = db.query(Product).get(int(answer))
+            except (ValueError, TypeError):
+                # Answer is a label string — look it up from the question options
+                try:
+                    opts = json.loads(question.options) if question.options else []
+                    for opt in opts:
+                        if str(opt.get('label', '')).lower() == str(answer).lower() or str(opt.get('id', '')) == str(answer):
+                            product = db.query(Product).get(opt['id'])
+                            break
+                    if not product:
+                        # Fallback: search by name
+                        product = db.query(Product).filter(Product.name.ilike(f'%{answer}%')).first()
+                except Exception:
+                    pass
             if product:
                 item.product_id = product.id
                 item.name = product.name
@@ -557,13 +572,13 @@ def answer_review_question(session_id):
                 item.supplier_name = product.supplier.name if product.supplier else None
                 if not item.price_per_unit and product.current_price:
                     item.price_per_unit = product.current_price
- 
+
         elif item and question.question_type == 'trimming_loss':
             item.trimming_loss_pct = float(answer)
             if item.price_per_unit:
                 item.adjusted_price = round(item.price_per_unit / (1 - float(answer) / 100), 2)
                 item.value = round(item.adjusted_price * (item.quantity or 0), 2)
- 
+
         elif item and question.question_type == 'recipe_cost':
             if isinstance(answer, str) and answer == 'yes' or (isinstance(answer, dict) and answer.get('value') == 'yes'):
                 item.is_recipe_product = True
@@ -577,18 +592,18 @@ def answer_review_question(session_id):
                             item.price_per_unit = recipe.cost_per_unit
                             item.value = round(recipe.cost_per_unit * (item.quantity or 0), 2)
                         break
- 
+
         elif item and question.question_type == 'missing_price':
             item.price_per_unit = float(answer)
             item.value = round(float(answer) * (item.quantity or 0), 2)
- 
+
         db.commit()
- 
+
         # Check if all questions answered
         remaining = db.query(ReviewQuestion).filter_by(
             session_id=session_id, is_answered=False
         ).count()
- 
+
         return jsonify({
             'status': 'answered',
             'remaining_questions': remaining,
@@ -596,10 +611,10 @@ def answer_review_question(session_id):
         })
     finally:
         db.close()
- 
- 
+
+
 # ── Confirm Inventory ──────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/confirm/<int:session_id>', methods=['POST'])
 def confirm_inventory(session_id):
     """Confirm and finalize an inventory session."""
@@ -608,7 +623,7 @@ def confirm_inventory(session_id):
         session = db.query(InventorySession).get(session_id)
         if not session:
             return jsonify({'error': 'Session not found'}), 404
- 
+
         # Calculate final values for all items
         for item in session.items:
             if item.price_per_unit and item.quantity:
@@ -618,15 +633,15 @@ def confirm_inventory(session_id):
                 else:
                     item.adjusted_price = item.price_per_unit
                     item.value = round(item.price_per_unit * item.quantity, 2)
- 
+
         # Calculate total
         total = sum(item.value or 0 for item in session.items)
         session.total_value = round(total, 2)
         session.status = 'confirmed'
         session.confirmed_at = datetime.utcnow()
- 
+
         db.commit()
- 
+
         return jsonify({
             'status': 'confirmed',
             'session_id': session.id,
@@ -636,10 +651,10 @@ def confirm_inventory(session_id):
         })
     finally:
         db.close()
- 
- 
+
+
 # ── Recipe Text Parsing ────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/recipes/parse-text', methods=['POST'])
 def parse_recipe_text():
     """
@@ -650,15 +665,15 @@ def parse_recipe_text():
     try:
         data = request.json
         raw_text = data.get('text', '')
- 
+
         if not raw_text.strip():
             return jsonify({'error': 'No text provided'}), 400
- 
+
         result = parse_recipe_text_with_ai(raw_text, db)
- 
+
         if not result:
             return jsonify({'error': 'Failed to parse recipe text'}), 500
- 
+
         # Try to match ingredients to known products and get prices
         for ing in result.get('ingredients', []):
             if ing.get('name'):
@@ -671,16 +686,16 @@ def parse_recipe_text():
                         ing['cost_per_unit'] = matches[0].current_price
                     if matches[0].unit:
                         ing['product_unit'] = matches[0].unit
- 
+
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
- 
- 
+
+
 # ── Recipes ────────────────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/recipes', methods=['GET'])
 def get_recipes():
     """Get all recipes."""
@@ -703,8 +718,8 @@ def get_recipes():
         } for r in recipes])
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/recipes/<int:recipe_id>', methods=['GET'])
 def get_recipe_detail(recipe_id):
     """Get recipe with all ingredients."""
@@ -713,7 +728,7 @@ def get_recipe_detail(recipe_id):
         recipe = db.query(Recipe).get(recipe_id)
         if not recipe:
             return jsonify({'error': 'Recipe not found'}), 404
- 
+
         return jsonify({
             'id': recipe.id,
             'name': recipe.name,
@@ -740,8 +755,8 @@ def get_recipe_detail(recipe_id):
         })
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/recipes', methods=['POST'])
 def create_recipe():
     """Create a new recipe with ingredients."""
@@ -760,18 +775,18 @@ def create_recipe():
         )
         db.add(recipe)
         db.flush()
- 
+
         ingredients_total = 0
         for ing_data in data.get('ingredients', []):
             cost = ing_data.get('cost', 0) or 0
             trimming_pct = ing_data.get('trimming_pct', 0) or 0
- 
+
             # Calculate adjusted cost with trimming
             if trimming_pct > 0 and cost > 0:
                 adjusted_cost = round(cost / (1 - trimming_pct / 100), 2)
             else:
                 adjusted_cost = cost
- 
+
             ing = RecipeIngredient(
                 recipe_id=recipe.id,
                 product_id=ing_data.get('product_id'),
@@ -785,13 +800,13 @@ def create_recipe():
             )
             db.add(ing)
             ingredients_total += adjusted_cost
- 
+
         # Apply seasoning cost
         seasoning_cost = round(ingredients_total * (recipe.seasoning_pct / 100), 2)
         recipe.total_cost = round(ingredients_total + seasoning_cost, 2)
         if recipe.total_yield and recipe.total_yield > 0:
             recipe.cost_per_unit = round(recipe.total_cost / recipe.total_yield, 2)
- 
+
         db.commit()
         return jsonify({
             'id': recipe.id,
@@ -804,8 +819,8 @@ def create_recipe():
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/recipes/<int:recipe_id>', methods=['PUT'])
 def update_recipe(recipe_id):
     """Update a recipe and its ingredients."""
@@ -814,7 +829,7 @@ def update_recipe(recipe_id):
         recipe = db.query(Recipe).get(recipe_id)
         if not recipe:
             return jsonify({'error': 'Recipe not found'}), 404
- 
+
         data = request.json
         if 'name' in data:
             recipe.name = data['name']
@@ -830,23 +845,23 @@ def update_recipe(recipe_id):
             recipe.notes = data['notes']
         if 'photos' in data:
             recipe.photos = json.dumps(data['photos']) if data['photos'] else None
- 
+
         # Replace ingredients if provided
         if 'ingredients' in data:
             # Remove old ingredients
             for old_ing in recipe.ingredients:
                 db.delete(old_ing)
- 
+
             ingredients_total = 0
             for ing_data in data['ingredients']:
                 cost = ing_data.get('cost', 0) or 0
                 trimming_pct = ing_data.get('trimming_pct', 0) or 0
- 
+
                 if trimming_pct > 0 and cost > 0:
                     adjusted_cost = round(cost / (1 - trimming_pct / 100), 2)
                 else:
                     adjusted_cost = cost
- 
+
                 ing = RecipeIngredient(
                     recipe_id=recipe.id,
                     product_id=ing_data.get('product_id'),
@@ -860,13 +875,13 @@ def update_recipe(recipe_id):
                 )
                 db.add(ing)
                 ingredients_total += adjusted_cost
- 
+
             seasoning_pct = recipe.seasoning_pct or 0
             seasoning_cost = round(ingredients_total * (seasoning_pct / 100), 2)
             recipe.total_cost = round(ingredients_total + seasoning_cost, 2)
             if recipe.total_yield and recipe.total_yield > 0:
                 recipe.cost_per_unit = round(recipe.total_cost / recipe.total_yield, 2)
- 
+
         db.commit()
         return jsonify({'status': 'updated', 'id': recipe.id})
     except Exception as e:
@@ -874,8 +889,8 @@ def update_recipe(recipe_id):
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
- 
- 
+
+
 @inventory_bp.route('/api/recipes/<int:recipe_id>', methods=['DELETE'])
 def delete_recipe(recipe_id):
     """Delete a recipe."""
@@ -889,10 +904,10 @@ def delete_recipe(recipe_id):
         return jsonify({'status': 'deleted'})
     finally:
         db.close()
- 
- 
+
+
 # ── Export ─────────────────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/export/<int:session_id>', methods=['GET'])
 def export_inventory(session_id):
     """Export inventory as JSON (frontend converts to PDF/Excel)."""
@@ -901,7 +916,7 @@ def export_inventory(session_id):
         session = db.query(InventorySession).get(session_id)
         if not session:
             return jsonify({'error': 'Session not found'}), 404
- 
+
         # Group items by category
         categories = {}
         for item in session.items:
@@ -918,7 +933,7 @@ def export_inventory(session_id):
                 'value': item.value,
                 'supplier_name': item.supplier_name
             })
- 
+
         return jsonify({
             'session_id': session.id,
             'year': session.year,
@@ -930,10 +945,10 @@ def export_inventory(session_id):
         })
     finally:
         db.close()
- 
- 
+
+
 # ── Dashboard / Trends ─────────────────────────────────────────────────
- 
+
 @inventory_bp.route('/api/inventory/trends', methods=['GET'])
 def get_inventory_trends():
     """Get inventory value trends over time for dashboard."""
@@ -942,7 +957,7 @@ def get_inventory_trends():
         sessions = db.query(InventorySession).filter_by(
             status='confirmed'
         ).order_by(InventorySession.year, InventorySession.month).all()
- 
+
         trends = [{
             'year': s.year,
             'month': s.month,
@@ -950,7 +965,7 @@ def get_inventory_trends():
             'total_value': s.total_value or 0,
             'item_count': len(s.items)
         } for s in sessions]
- 
+
         # Category breakdown for latest inventory
         category_breakdown = {}
         if sessions:
@@ -961,7 +976,7 @@ def get_inventory_trends():
                     category_breakdown[cat] = {'count': 0, 'value': 0}
                 category_breakdown[cat]['count'] += 1
                 category_breakdown[cat]['value'] += item.value or 0
- 
+
         # Month-over-month change
         mom_change = None
         if len(sessions) >= 2:
@@ -969,7 +984,7 @@ def get_inventory_trends():
             previous = sessions[-2].total_value or 0
             if previous > 0:
                 mom_change = round(((current - previous) / previous) * 100, 1)
- 
+
         return jsonify({
             'trends': trends,
             'category_breakdown': category_breakdown,
@@ -978,4 +993,3 @@ def get_inventory_trends():
         })
     finally:
         db.close()
- 
