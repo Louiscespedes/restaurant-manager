@@ -27,11 +27,13 @@ app.register_blueprint(inventory_bp)
 init_db()
 
 # Run migrations for new columns (safe to re-run — uses IF NOT EXISTS)
+from sqlalchemy import text as _text
 from models import engine as _engine
 _migration_sql = [
     "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS added_by TEXT",
     "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS seasoning_pct FLOAT DEFAULT 0",
     "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS photos TEXT",
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
     "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
     "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS adjusted_cost FLOAT",
     "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS notes TEXT",
@@ -39,7 +41,7 @@ _migration_sql = [
 try:
     with _engine.connect() as _conn:
         for _sql in _migration_sql:
-            _conn.execute(_sql)
+            _conn.execute(_text(_sql))
         _conn.commit()
     print("DB migration: new columns added successfully")
 except Exception as _e:
