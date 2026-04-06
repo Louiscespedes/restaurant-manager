@@ -234,6 +234,112 @@ class RecipeIngredient(Base):
     product = relationship('Product')
 
 
+# ── Dish & Menu Models ─────────────────────────────────────────────────
+
+class Dish(Base):
+    """A composed dish — made of recipes + standalone ingredients."""
+    __tablename__ = 'dishes'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    added_by = Column(String, nullable=True)  # Chef name
+    servings = Column(Float, default=1)  # How many portions this dish makes
+    total_cost = Column(Float, nullable=True)  # Sum of all recipe costs + ingredient costs
+    cost_per_serving = Column(Float, nullable=True)  # total_cost / servings
+    photos = Column(Text, nullable=True)  # JSON array of photo URLs
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    dish_recipes = relationship('DishRecipe', back_populates='dish', cascade='all, delete-orphan')
+    dish_ingredients = relationship('DishIngredient', back_populates='dish', cascade='all, delete-orphan')
+
+
+class DishRecipe(Base):
+    """Links a recipe into a dish — with portion scaling."""
+    __tablename__ = 'dish_recipes'
+
+    id = Column(Integer, primary_key=True)
+    dish_id = Column(Integer, ForeignKey('dishes.id'), nullable=False)
+    recipe_id = Column(Integer, ForeignKey('recipes.id'), nullable=False)
+    portions = Column(Float, default=1)  # How many portions of this recipe go into the dish
+    cost = Column(Float, nullable=True)  # recipe.cost_per_unit * portions
+    order = Column(Integer, default=0)
+
+    dish = relationship('Dish', back_populates='dish_recipes')
+    recipe = relationship('Recipe')
+
+
+class DishIngredient(Base):
+    """Standalone ingredients added directly to a dish (not from a recipe)."""
+    __tablename__ = 'dish_ingredients'
+
+    id = Column(Integer, primary_key=True)
+    dish_id = Column(Integer, ForeignKey('dishes.id'), nullable=False)
+    product_id = Column(Integer, ForeignKey('products.id'), nullable=True)
+    name = Column(String, nullable=False)
+    quantity = Column(Float, nullable=True)
+    unit = Column(String, nullable=True)  # kg, st, piece, liter
+    cost_per_unit = Column(Float, nullable=True)
+    cost = Column(Float, nullable=True)  # quantity * cost_per_unit (after conversion)
+    trimming_pct = Column(Float, default=0)
+    adjusted_cost = Column(Float, nullable=True)
+    pieces_per_kg = Column(Float, nullable=True)  # For AI unit conversion (e.g. 7 langoustines/kg)
+    notes = Column(String, nullable=True)
+    order = Column(Integer, default=0)
+
+    dish = relationship('Dish', back_populates='dish_ingredients')
+    product = relationship('Product')
+
+
+class Menu(Base):
+    """A menu — lunch, tasting, or personalized."""
+    __tablename__ = 'menus'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    menu_type = Column(String, nullable=False)  # lunch, tasting, personalized
+    description = Column(Text, nullable=True)
+    added_by = Column(String, nullable=True)
+    total_cost = Column(Float, nullable=True)  # Sum of all section costs
+    cost_per_menu = Column(Float, nullable=True)  # Total cost for 1 menu served
+    photos = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    sections = relationship('MenuSection', back_populates='menu', cascade='all, delete-orphan')
+
+
+class MenuSection(Base):
+    """A section within a menu — e.g. Starter, Main Course, Dessert."""
+    __tablename__ = 'menu_sections'
+
+    id = Column(Integer, primary_key=True)
+    menu_id = Column(Integer, ForeignKey('menus.id'), nullable=False)
+    name = Column(String, nullable=False)  # "Starter", "Main Course", "Snacks", etc.
+    description = Column(Text, nullable=True)
+    order = Column(Integer, default=0)
+
+    menu = relationship('Menu', back_populates='sections')
+    items = relationship('MenuSectionItem', back_populates='section', cascade='all, delete-orphan')
+
+
+class MenuSectionItem(Base):
+    """An item in a menu section — points to a dish."""
+    __tablename__ = 'menu_section_items'
+
+    id = Column(Integer, primary_key=True)
+    section_id = Column(Integer, ForeignKey('menu_sections.id'), nullable=False)
+    dish_id = Column(Integer, ForeignKey('dishes.id'), nullable=True)  # Link to existing dish
+    name = Column(String, nullable=True)  # Display name override
+    portions = Column(Float, default=1)  # How many portions of this dish per menu
+    cost = Column(Float, nullable=True)  # dish.cost_per_serving * portions
+    order = Column(Integer, default=0)
+
+    section = relationship('MenuSection', back_populates='items')
+    dish = relationship('Dish')
+
+
 def init_db():
     """Create all tables and return a session."""
     Base.metadata.create_all(engine)
