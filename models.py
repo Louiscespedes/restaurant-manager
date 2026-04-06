@@ -209,12 +209,14 @@ class Recipe(Base):
     selling_price = Column(Float, nullable=True)  # If sold standalone (e.g. sauce, bread)
     food_cost_pct = Column(Float, nullable=True)  # (cost_per_unit / selling_price) * 100
     seasoning_pct = Column(Float, default=0)  # seasoning cost as % of ingredients total
+    price_review_status = Column(String, default='pending')  # pending, reviewing, completed
     notes = Column(Text, nullable=True)
     photos = Column(Text, nullable=True)  # JSON array of photo URLs
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     ingredients = relationship('RecipeIngredient', back_populates='recipe', cascade='all, delete-orphan')
+    review_questions = relationship('RecipeReviewQuestion', cascade='all, delete-orphan')
 
 
 class RecipeIngredient(Base):
@@ -226,14 +228,40 @@ class RecipeIngredient(Base):
     product_id = Column(Integer, ForeignKey('products.id'), nullable=True)
     name = Column(String, nullable=False)
     quantity = Column(Float, nullable=True)
-    unit = Column(String, nullable=True)
-    cost = Column(Float, nullable=True)  # raw cost before trimming
+    unit = Column(String, nullable=True)  # kg, g, st, liter, dl, ml, msk, tsk, etc.
+    price_per_unit = Column(Float, nullable=True)  # Price per kg/liter/st from invoice or manual
+    price_unit = Column(String, nullable=True)  # The unit the price is in (e.g. 'kg' even if recipe uses 'g')
+    price_source = Column(String, nullable=True)  # 'invoice', 'manual', 'estimated'
+    cost = Column(Float, nullable=True)  # Calculated: quantity * price (with unit conversion)
     trimming_pct = Column(Float, default=0)  # trimming loss percentage
     adjusted_cost = Column(Float, nullable=True)  # cost after trimming: cost / (1 - trim%)
+    needs_review = Column(Boolean, default=False)  # True if AI couldn't find a confident price match
     notes = Column(String, nullable=True)  # e.g. "finely diced", "to taste"
 
     recipe = relationship('Recipe', back_populates='ingredients')
     product = relationship('Product')
+
+
+class RecipeReviewQuestion(Base):
+    """AI-generated review questions for recipe ingredient pricing."""
+    __tablename__ = 'recipe_review_questions'
+
+    id = Column(Integer, primary_key=True)
+    recipe_id = Column(Integer, ForeignKey('recipes.id'), nullable=False)
+    ingredient_id = Column(Integer, ForeignKey('recipe_ingredients.id'), nullable=True)
+    question_type = Column(String, nullable=False)
+    # Types: 'price_match' (multiple products match), 'missing_price' (no product found),
+    #        'unit_mismatch' (recipe uses g but price is per kg), 'quantity_check' (seems too high/low),
+    #        'confirm_price' (auto-matched, just confirm)
+    question_text = Column(String, nullable=False)
+    options = Column(Text, nullable=True)  # JSON array of options
+    answer = Column(String, nullable=True)
+    is_answered = Column(Boolean, default=False)
+    order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    recipe = relationship('Recipe')
+    ingredient = relationship('RecipeIngredient')
 
 
 # ── Dish & Menu Models ─────────────────────────────────────────────────
