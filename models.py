@@ -201,11 +201,14 @@ class Recipe(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
+    added_by = Column(String, nullable=True)  # Chef name
     total_yield = Column(Float, nullable=True)  # e.g. 2 (liters)
     yield_unit = Column(String, nullable=True)  # e.g. 'liter', 'kg', 'portions'
     total_cost = Column(Float, nullable=True)  # sum of ingredient costs
     cost_per_unit = Column(Float, nullable=True)  # total_cost / total_yield
+    seasoning_pct = Column(Float, default=0)  # seasoning cost as % of ingredients total
     notes = Column(Text, nullable=True)
+    photos = Column(Text, nullable=True)  # JSON array of photo URLs
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -222,7 +225,10 @@ class RecipeIngredient(Base):
     name = Column(String, nullable=False)
     quantity = Column(Float, nullable=True)
     unit = Column(String, nullable=True)
-    cost = Column(Float, nullable=True)
+    cost = Column(Float, nullable=True)  # raw cost before trimming
+    trimming_pct = Column(Float, default=0)  # trimming loss percentage
+    adjusted_cost = Column(Float, nullable=True)  # cost after trimming: cost / (1 - trim%)
+    notes = Column(String, nullable=True)  # e.g. "finely diced", "to taste"
 
     recipe = relationship('Recipe', back_populates='ingredients')
     product = relationship('Product')
