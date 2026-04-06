@@ -1,6 +1,5 @@
 """
-M.E.P — Mise en Place
-Restaurant management API — Flask backend deployed on Railway.
+Restaurant Manager API — Flask backend deployed on Railway.
 Connects to Fortnox for live invoice data, serves to Lovable frontend.
 """
 from flask import Flask, jsonify, request, redirect
@@ -41,6 +40,15 @@ _migration_sql = [
     "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
     "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS adjusted_cost FLOAT",
     "ALTER TABLE recipe_ingredients ADD COLUMN IF NOT EXISTS notes TEXT",
+    # Food cost & margin columns
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS selling_price FLOAT",
+    "ALTER TABLE recipes ADD COLUMN IF NOT EXISTS food_cost_pct FLOAT",
+    "ALTER TABLE dishes ADD COLUMN IF NOT EXISTS selling_price FLOAT",
+    "ALTER TABLE dishes ADD COLUMN IF NOT EXISTS food_cost_pct FLOAT",
+    "ALTER TABLE dishes ADD COLUMN IF NOT EXISTS margin FLOAT",
+    "ALTER TABLE menus ADD COLUMN IF NOT EXISTS selling_price FLOAT",
+    "ALTER TABLE menus ADD COLUMN IF NOT EXISTS food_cost_pct FLOAT",
+    "ALTER TABLE menus ADD COLUMN IF NOT EXISTS margin FLOAT",
 ]
 try:
     with _engine.connect() as _conn:
