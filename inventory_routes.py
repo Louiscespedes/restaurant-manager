@@ -6,7 +6,9 @@ from flask import Blueprint, jsonify, request
 from datetime import datetime
 from models import (
     Session, InventorySession, InventoryItem, ReviewQuestion,
-    Product, Supplier, Recipe, RecipeIngredient
+    Product, Supplier, Recipe, RecipeIngredient,
+    Dish, DishRecipe, DishIngredient,
+    Menu, MenuSection, MenuSectionItem
 )
 from ai_parser import parse_inventory_with_ai, generate_smart_questions, parse_recipe_text_with_ai
 
@@ -991,5 +993,638 @@ def get_inventory_trends():
             'month_over_month_change': mom_change,
             'total_inventories': len(sessions)
         })
+    finally:
+        db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DISHES — composed of recipes + standalone ingredients
+# ══════════════════════════════════════════════════════════════════════
+
+def _recalc_dish_cost(dish, db):
+    """Recalculate total_cost and cost_per_serving for a dish."""
+    total = 0.0
+    for dr in dish.dish_recipes:
+        recipe = db.query(Recipe).get(dr.recipe_id)
+        if recipe and recipe.cost_per_unit:
+            dr.cost = round(recipe.cost_per_unit * (dr.portions or 1), 2)
+        total += dr.cost or 0
+    for di in dish.dish_ingredients:
+        if di.adjusted_cost:
+            total += di.adjusted_cost
+        elif di.cost:
+            total += di.cost
+    dish.total_cost = round(total, 2)
+    dish.cost_per_serving = round(total / (dish.servings or 1), 2)
+
+
+def _calc_ingredient_cost(ing, db):
+    """Calculate cost for a standalone dish ingredient, handling unit conversion."""
+    if ing.product_id:
+        product = db.query(Product).get(ing.product_id)
+        if product and product.current_price:
+            ing.cost_per_unit = product.current_price
+            product_unit = (product.unit or '').lower()
+            ing_unit = (ing.unit or '').lower()
+            # Unit conversion: piece vs kg
+            if ing_unit in ('piece', 'pieces', 'st', 'pcs') and product_unit == 'kg':
+                if ing.pieces_per_kg and ing.pieces_per_kg > 0:
+                    cost_per_piece = product.current_price / ing.pieces_per_kg
+                    ing.cost = round(cost_per_piece * (ing.quantity or 1), 2)
+                else:
+                    ing.cost = None  # Need AI to ask
+                    return
+            else:
+                ing.cost = round(product.current_price * (ing.quantity or 0), 2)
+    elif ing.cost_per_unit and ing.quantity:
+        ing.cost = round(ing.cost_per_unit * ing.quantity, 2)
+    # Apply trimming
+    if ing.cost and ing.trimming_pct and ing.trimming_pct > 0:
+        ing.adjusted_cost = round(ing.cost / (1 - ing.trimming_pct / 100), 2)
+    else:
+        ing.adjusted_cost = ing.cost
+
+
+@inventory_bp.route('/api/dishes', methods=['GET'])
+def get_dishes():
+    """List all dishes."""
+    db = Session()
+    try:
+        dishes = db.query(Dish).order_by(Dish.updated_at.desc()).all()
+        return jsonify([{
+            'id': d.id,
+            'name': d.name,
+            'description': d.description,
+            'added_by': d.added_by,
+            'servings': d.servings,
+            'total_cost': d.total_cost,
+            'cost_per_serving': d.cost_per_serving,
+            'photos': json.loads(d.photos) if d.photos else [],
+            'recipe_count': len(d.dish_recipes),
+            'ingredient_count': len(d.dish_ingredients),
+            'created_at': d.created_at.isoformat() if d.created_at else None,
+            'updated_at': d.updated_at.isoformat() if d.updated_at else None,
+        } for d in dishes])
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/dishes/<int:dish_id>', methods=['GET'])
+def get_dish(dish_id):
+    """Get a single dish with all recipes and ingredients."""
+    db = Session()
+    try:
+        d = db.query(Dish).get(dish_id)
+        if not d:
+            return jsonify({'error': 'Dish not found'}), 404
+        return jsonify({
+            'id': d.id,
+            'name': d.name,
+            'description': d.description,
+            'added_by': d.added_by,
+            'servings': d.servings,
+            'total_cost': d.total_cost,
+            'cost_per_serving': d.cost_per_serving,
+            'photos': json.loads(d.photos) if d.photos else [],
+            'created_at': d.created_at.isoformat() if d.created_at else None,
+            'updated_at': d.updated_at.isoformat() if d.updated_at else None,
+            'recipes': [{
+                'id': dr.id,
+                'recipe_id': dr.recipe_id,
+                'recipe_name': dr.recipe.name if dr.recipe else None,
+                'portions': dr.portions,
+                'cost': dr.cost,
+                'order': dr.order,
+            } for dr in sorted(d.dish_recipes, key=lambda x: x.order)],
+            'ingredients': [{
+                'id': di.id,
+                'product_id': di.product_id,
+                'name': di.name,
+                'quantity': di.quantity,
+                'unit': di.unit,
+                'cost_per_unit': di.cost_per_unit,
+                'cost': di.cost,
+                'trimming_pct': di.trimming_pct,
+                'adjusted_cost': di.adjusted_cost,
+                'pieces_per_kg': di.pieces_per_kg,
+                'notes': di.notes,
+                'order': di.order,
+                'needs_conversion': di.cost is None and di.product_id is not None,
+            } for di in sorted(d.dish_ingredients, key=lambda x: x.order)],
+        })
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/dishes', methods=['POST'])
+def create_dish():
+    """Create a new dish."""
+    db = Session()
+    try:
+        data = request.json
+        dish = Dish(
+            name=data.get('name', 'Untitled Dish'),
+            description=data.get('description'),
+            added_by=data.get('added_by'),
+            servings=data.get('servings', 1),
+            photos=json.dumps(data.get('photos', [])),
+        )
+        db.add(dish)
+        db.flush()
+
+        # Add recipes
+        for i, r in enumerate(data.get('recipes', [])):
+            dr = DishRecipe(
+                dish_id=dish.id,
+                recipe_id=r['recipe_id'],
+                portions=r.get('portions', 1),
+                order=i,
+            )
+            db.add(dr)
+
+        # Add standalone ingredients
+        for i, ing in enumerate(data.get('ingredients', [])):
+            di = DishIngredient(
+                dish_id=dish.id,
+                product_id=ing.get('product_id'),
+                name=ing.get('name', 'Unknown'),
+                quantity=ing.get('quantity'),
+                unit=ing.get('unit'),
+                cost_per_unit=ing.get('cost_per_unit'),
+                trimming_pct=ing.get('trimming_pct', 0),
+                pieces_per_kg=ing.get('pieces_per_kg'),
+                notes=ing.get('notes'),
+                order=i,
+            )
+            _calc_ingredient_cost(di, db)
+            db.add(di)
+
+        db.flush()
+        _recalc_dish_cost(dish, db)
+        dish.updated_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({'id': dish.id, 'total_cost': dish.total_cost, 'cost_per_serving': dish.cost_per_serving}), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/dishes/<int:dish_id>', methods=['PUT'])
+def update_dish(dish_id):
+    """Update an existing dish."""
+    db = Session()
+    try:
+        dish = db.query(Dish).get(dish_id)
+        if not dish:
+            return jsonify({'error': 'Dish not found'}), 404
+
+        data = request.json
+        dish.name = data.get('name', dish.name)
+        dish.description = data.get('description', dish.description)
+        dish.added_by = data.get('added_by', dish.added_by)
+        dish.servings = data.get('servings', dish.servings)
+        if 'photos' in data:
+            dish.photos = json.dumps(data['photos'])
+
+        # Replace recipes
+        if 'recipes' in data:
+            for dr in dish.dish_recipes:
+                db.delete(dr)
+            db.flush()
+            for i, r in enumerate(data['recipes']):
+                dr = DishRecipe(
+                    dish_id=dish.id,
+                    recipe_id=r['recipe_id'],
+                    portions=r.get('portions', 1),
+                    order=i,
+                )
+                db.add(dr)
+
+        # Replace ingredients
+        if 'ingredients' in data:
+            for di in dish.dish_ingredients:
+                db.delete(di)
+            db.flush()
+            for i, ing in enumerate(data['ingredients']):
+                di = DishIngredient(
+                    dish_id=dish.id,
+                    product_id=ing.get('product_id'),
+                    name=ing.get('name', 'Unknown'),
+                    quantity=ing.get('quantity'),
+                    unit=ing.get('unit'),
+                    cost_per_unit=ing.get('cost_per_unit'),
+                    trimming_pct=ing.get('trimming_pct', 0),
+                    pieces_per_kg=ing.get('pieces_per_kg'),
+                    notes=ing.get('notes'),
+                    order=i,
+                )
+                _calc_ingredient_cost(di, db)
+                db.add(di)
+
+        db.flush()
+        _recalc_dish_cost(dish, db)
+        dish.updated_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({'id': dish.id, 'total_cost': dish.total_cost, 'cost_per_serving': dish.cost_per_serving})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/dishes/<int:dish_id>', methods=['DELETE'])
+def delete_dish(dish_id):
+    """Delete a dish."""
+    db = Session()
+    try:
+        dish = db.query(Dish).get(dish_id)
+        if not dish:
+            return jsonify({'error': 'Dish not found'}), 404
+        db.delete(dish)
+        db.commit()
+        return jsonify({'status': 'deleted'})
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/dishes/<int:dish_id>/convert-unit', methods=['POST'])
+def convert_dish_ingredient_unit(dish_id):
+    """AI unit conversion — user tells us pieces_per_kg for an ingredient."""
+    db = Session()
+    try:
+        data = request.json
+        ingredient_id = data.get('ingredient_id')
+        pieces_per_kg = data.get('pieces_per_kg')
+
+        di = db.query(DishIngredient).get(ingredient_id)
+        if not di or di.dish_id != dish_id:
+            return jsonify({'error': 'Ingredient not found'}), 404
+
+        di.pieces_per_kg = float(pieces_per_kg)
+        _calc_ingredient_cost(di, db)
+
+        dish = db.query(Dish).get(dish_id)
+        _recalc_dish_cost(dish, db)
+        dish.updated_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({
+            'ingredient_id': di.id,
+            'cost': di.cost,
+            'adjusted_cost': di.adjusted_cost,
+            'pieces_per_kg': di.pieces_per_kg,
+            'dish_total_cost': dish.total_cost,
+            'dish_cost_per_serving': dish.cost_per_serving,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MENUS — lunch, tasting, personalized
+# ══════════════════════════════════════════════════════════════════════
+
+def _recalc_menu_cost(menu, db):
+    """Recalculate total cost for a menu (1 menu served)."""
+    total = 0.0
+    for section in menu.sections:
+        for item in section.items:
+            if item.dish_id:
+                dish = db.query(Dish).get(item.dish_id)
+                if dish and dish.cost_per_serving:
+                    item.cost = round(dish.cost_per_serving * (item.portions or 1), 2)
+            total += item.cost or 0
+    menu.total_cost = round(total, 2)
+    menu.cost_per_menu = round(total, 2)  # Already per 1 menu
+
+
+@inventory_bp.route('/api/menus', methods=['GET'])
+def get_menus():
+    """List all menus."""
+    db = Session()
+    try:
+        menus = db.query(Menu).order_by(Menu.updated_at.desc()).all()
+        return jsonify([{
+            'id': m.id,
+            'name': m.name,
+            'menu_type': m.menu_type,
+            'description': m.description,
+            'added_by': m.added_by,
+            'total_cost': m.total_cost,
+            'cost_per_menu': m.cost_per_menu,
+            'section_count': len(m.sections),
+            'photos': json.loads(m.photos) if m.photos else [],
+            'created_at': m.created_at.isoformat() if m.created_at else None,
+            'updated_at': m.updated_at.isoformat() if m.updated_at else None,
+        } for m in menus])
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>', methods=['GET'])
+def get_menu(menu_id):
+    """Get a single menu with all sections and items."""
+    db = Session()
+    try:
+        m = db.query(Menu).get(menu_id)
+        if not m:
+            return jsonify({'error': 'Menu not found'}), 404
+        return jsonify({
+            'id': m.id,
+            'name': m.name,
+            'menu_type': m.menu_type,
+            'description': m.description,
+            'added_by': m.added_by,
+            'total_cost': m.total_cost,
+            'cost_per_menu': m.cost_per_menu,
+            'photos': json.loads(m.photos) if m.photos else [],
+            'created_at': m.created_at.isoformat() if m.created_at else None,
+            'updated_at': m.updated_at.isoformat() if m.updated_at else None,
+            'sections': [{
+                'id': s.id,
+                'name': s.name,
+                'description': s.description,
+                'order': s.order,
+                'items': [{
+                    'id': item.id,
+                    'dish_id': item.dish_id,
+                    'dish_name': item.dish.name if item.dish else item.name,
+                    'name': item.name,
+                    'portions': item.portions,
+                    'cost': item.cost,
+                    'order': item.order,
+                    'dish_cost_per_serving': item.dish.cost_per_serving if item.dish else None,
+                } for item in sorted(s.items, key=lambda x: x.order)]
+            } for s in sorted(m.sections, key=lambda x: x.order)]
+        })
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus', methods=['POST'])
+def create_menu():
+    """Create a new menu with default sections based on type."""
+    db = Session()
+    try:
+        data = request.json
+        menu_type = data.get('menu_type', 'personalized')
+
+        menu = Menu(
+            name=data.get('name', f'New {menu_type.title()} Menu'),
+            menu_type=menu_type,
+            description=data.get('description'),
+            added_by=data.get('added_by'),
+            photos=json.dumps(data.get('photos', [])),
+        )
+        db.add(menu)
+        db.flush()
+
+        # Create default sections based on menu type
+        if 'sections' in data:
+            # User provided custom sections
+            for i, s in enumerate(data['sections']):
+                section = MenuSection(
+                    menu_id=menu.id,
+                    name=s.get('name', f'Course {i+1}'),
+                    description=s.get('description'),
+                    order=i,
+                )
+                db.add(section)
+                db.flush()
+                for j, item in enumerate(s.get('items', [])):
+                    si = MenuSectionItem(
+                        section_id=section.id,
+                        dish_id=item.get('dish_id'),
+                        name=item.get('name'),
+                        portions=item.get('portions', 1),
+                        order=j,
+                    )
+                    db.add(si)
+        else:
+            # Auto-create default sections
+            defaults = {
+                'lunch': [
+                    {'name': 'Starter', 'order': 0},
+                    {'name': 'Main Course', 'order': 1},
+                    {'name': 'Dessert', 'order': 2},
+                ],
+                'tasting': [
+                    {'name': 'Snacks', 'order': 0},
+                    {'name': 'Dishes', 'order': 1},
+                    {'name': 'Mignardises', 'order': 2},
+                ],
+                'personalized': [
+                    {'name': 'Course 1', 'order': 0},
+                ],
+            }
+            for s in defaults.get(menu_type, defaults['personalized']):
+                section = MenuSection(
+                    menu_id=menu.id,
+                    name=s['name'],
+                    order=s['order'],
+                )
+                db.add(section)
+
+        db.flush()
+        _recalc_menu_cost(menu, db)
+        menu.updated_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({'id': menu.id, 'total_cost': menu.total_cost}), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>', methods=['PUT'])
+def update_menu(menu_id):
+    """Update a menu — name, sections, items."""
+    db = Session()
+    try:
+        menu = db.query(Menu).get(menu_id)
+        if not menu:
+            return jsonify({'error': 'Menu not found'}), 404
+
+        data = request.json
+        menu.name = data.get('name', menu.name)
+        menu.description = data.get('description', menu.description)
+        menu.added_by = data.get('added_by', menu.added_by)
+        if 'photos' in data:
+            menu.photos = json.dumps(data['photos'])
+
+        # Replace sections if provided
+        if 'sections' in data:
+            for s in menu.sections:
+                for item in s.items:
+                    db.delete(item)
+                db.delete(s)
+            db.flush()
+
+            for i, s in enumerate(data['sections']):
+                section = MenuSection(
+                    menu_id=menu.id,
+                    name=s.get('name', f'Course {i+1}'),
+                    description=s.get('description'),
+                    order=i,
+                )
+                db.add(section)
+                db.flush()
+                for j, item in enumerate(s.get('items', [])):
+                    si = MenuSectionItem(
+                        section_id=section.id,
+                        dish_id=item.get('dish_id'),
+                        name=item.get('name'),
+                        portions=item.get('portions', 1),
+                        order=j,
+                    )
+                    db.add(si)
+
+        db.flush()
+        _recalc_menu_cost(menu, db)
+        menu.updated_at = datetime.utcnow()
+        db.commit()
+
+        return jsonify({'id': menu.id, 'total_cost': menu.total_cost, 'cost_per_menu': menu.cost_per_menu})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>', methods=['DELETE'])
+def delete_menu(menu_id):
+    """Delete a menu."""
+    db = Session()
+    try:
+        menu = db.query(Menu).get(menu_id)
+        if not menu:
+            return jsonify({'error': 'Menu not found'}), 404
+        db.delete(menu)
+        db.commit()
+        return jsonify({'status': 'deleted'})
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>/sections', methods=['POST'])
+def add_menu_section(menu_id):
+    """Add a new section to a menu."""
+    db = Session()
+    try:
+        menu = db.query(Menu).get(menu_id)
+        if not menu:
+            return jsonify({'error': 'Menu not found'}), 404
+
+        data = request.json
+        max_order = max([s.order for s in menu.sections], default=-1)
+        section = MenuSection(
+            menu_id=menu.id,
+            name=data.get('name', f'Course {max_order + 2}'),
+            description=data.get('description'),
+            order=max_order + 1,
+        )
+        db.add(section)
+        db.commit()
+
+        return jsonify({'id': section.id, 'name': section.name, 'order': section.order}), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>/sections/<int:section_id>', methods=['DELETE'])
+def delete_menu_section(menu_id, section_id):
+    """Remove a section from a menu."""
+    db = Session()
+    try:
+        section = db.query(MenuSection).get(section_id)
+        if not section or section.menu_id != menu_id:
+            return jsonify({'error': 'Section not found'}), 404
+        db.delete(section)
+        menu = db.query(Menu).get(menu_id)
+        db.flush()
+        _recalc_menu_cost(menu, db)
+        db.commit()
+        return jsonify({'status': 'deleted'})
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>/sections/<int:section_id>/items', methods=['POST'])
+def add_section_item(menu_id, section_id):
+    """Add a dish to a menu section."""
+    db = Session()
+    try:
+        section = db.query(MenuSection).get(section_id)
+        if not section or section.menu_id != menu_id:
+            return jsonify({'error': 'Section not found'}), 404
+
+        data = request.json
+        max_order = max([i.order for i in section.items], default=-1)
+
+        item = MenuSectionItem(
+            section_id=section.id,
+            dish_id=data.get('dish_id'),
+            name=data.get('name'),
+            portions=data.get('portions', 1),
+            order=max_order + 1,
+        )
+
+        # Calculate cost from dish
+        if item.dish_id:
+            dish = db.query(Dish).get(item.dish_id)
+            if dish and dish.cost_per_serving:
+                item.cost = round(dish.cost_per_serving * (item.portions or 1), 2)
+
+        db.add(item)
+        db.flush()
+        menu = db.query(Menu).get(menu_id)
+        _recalc_menu_cost(menu, db)
+        db.commit()
+
+        return jsonify({
+            'id': item.id,
+            'dish_id': item.dish_id,
+            'name': item.name,
+            'cost': item.cost,
+            'menu_total_cost': menu.total_cost,
+        }), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@inventory_bp.route('/api/menus/<int:menu_id>/sections/<int:section_id>/items/<int:item_id>', methods=['DELETE'])
+def delete_section_item(menu_id, section_id, item_id):
+    """Remove a dish from a menu section."""
+    db = Session()
+    try:
+        item = db.query(MenuSectionItem).get(item_id)
+        if not item or item.section_id != section_id:
+            return jsonify({'error': 'Item not found'}), 404
+        section = db.query(MenuSection).get(section_id)
+        if not section or section.menu_id != menu_id:
+            return jsonify({'error': 'Section not found'}), 404
+        db.delete(item)
+        menu = db.query(Menu).get(menu_id)
+        db.flush()
+        _recalc_menu_cost(menu, db)
+        db.commit()
+        return jsonify({'status': 'deleted', 'menu_total_cost': menu.total_cost})
     finally:
         db.close()
