@@ -21,6 +21,7 @@ class SyncService:
         self.fortnox = fortnox_client
 
     def sync_all(self):
+        """Run a full sync: suppliers → articles → invoices."""
         results = {}
         results['suppliers'] = self.sync_suppliers()
         results['articles'] = self.sync_articles()
@@ -28,6 +29,7 @@ class SyncService:
         return results
 
     def sync_suppliers(self):
+        """Sync all suppliers from Fortnox."""
         db = Session()
         log = SyncLog(sync_type='suppliers', status='in_progress')
         db.add(log)
@@ -81,6 +83,7 @@ class SyncService:
             db.close()
 
     def sync_articles(self):
+        """Sync all articles/products from Fortnox."""
         db = Session()
         log = SyncLog(sync_type='articles', status='in_progress')
         db.add(log)
@@ -124,6 +127,10 @@ class SyncService:
             db.close()
 
     def sync_invoices(self):
+        """
+        Sync supplier invoices from Fortnox.
+        Creates invoice records with basic metadata from the API.
+        """
         db = Session()
         log = SyncLog(sync_type='invoices', status='in_progress')
         db.add(log)
@@ -137,19 +144,23 @@ class SyncService:
             for fi in fortnox_invoices:
                 given_number = str(fi.get('GivenNumber', ''))
 
+                # Skip if already synced
                 existing = db.query(Invoice).filter_by(fortnox_id=given_number).first()
                 if existing:
                     count += 1
                     continue
 
+                # Get full invoice detail
                 try:
                     detail = self.fortnox.get_supplier_invoice_detail(given_number)
                 except Exception:
                     continue
 
+                # Find supplier
                 supplier_number = str(detail.get('SupplierNumber', ''))
                 supplier = db.query(Supplier).filter_by(fortnox_id=supplier_number).first()
 
+                # Parse dates
                 invoice_date = None
                 due_date = None
                 try:
@@ -160,6 +171,7 @@ class SyncService:
                 except (ValueError, TypeError):
                     pass
 
+                # Create invoice record
                 invoice = Invoice(
                     fortnox_id=given_number,
                     supplier_id=supplier.id if supplier else None,
@@ -199,11 +211,52 @@ class SyncService:
         finally:
             db.close()
 
+    def _has_real_line_items(self, db, invoice_id):
+        """
+        Check if an invoice has REAL extracted line items (not just accounting junk).
+        Accounting entries from Fortnox have no article_number, no description, qty=0.
+        """
+        items = db.query(InvoiceLineItem).filter_by(invoice_id=invoice_id).all()
+        if not items:
+            return False
+        # Check if ANY item has real product data
+        for item in items:
+            if item.article_number or (item.description and item.description not in ('', '[No PDF available]', '[Could not extract products from PDF]')):
+                if item.quantity and item.quantity > 0:
+                    return True
+        return False
+
+    def clear_junk_line_items(self):
+        """
+        Remove accounting-entry line items that have no real product data.
+        These were synced from Fortnox API but contain no useful info.
+        Returns count of invoices cleared.
+        """
+        db = Session()
+        try:
+            invoices = db.query(Invoice).all()
+            cleared = 0
+            for inv in invoices:
+                if not self._has_real_line_items(db, inv.id):
+                    junk = db.query(InvoiceLineItem).filter_by(invoice_id=inv.id).all()
+                    if junk:
+                        for item in junk:
+                            db.delete(item)
+                        cleared += 1
+            db.commit()
+            return {'status': 'success', 'invoices_cleared': cleared}
+        except Exception as e:
+            db.rollback()
+            return {'status': 'error', 'message': str(e)}
+        finally:
+            db.close()
+
     def extract_invoice_products(self, invoice_id=None, limit=10):
         """
         Download PDFs from Fortnox and extract product data using Claude API.
         If invoice_id is given, extract just that one.
         Otherwise, extract from invoices that haven't been processed yet.
+        Automatically clears junk accounting line items first.
         """
         db = Session()
         log = SyncLog(sync_type='pdf_extraction', status='in_progress')
@@ -212,15 +265,24 @@ class SyncService:
 
         try:
             if invoice_id:
+                # For a specific invoice, clear its junk line items first
+                if not self._has_real_line_items(db, invoice_id):
+                    db.query(InvoiceLineItem).filter_by(invoice_id=invoice_id).delete()
+                    db.commit()
                 invoices = [db.query(Invoice).get(invoice_id)]
                 invoices = [inv for inv in invoices if inv]
             else:
-                # Find invoices with no line items (not yet extracted)
-                invoices = db.query(Invoice).filter(
-                    ~Invoice.id.in_(
-                        db.query(InvoiceLineItem.invoice_id).distinct()
-                    )
-                ).order_by(Invoice.invoice_date.desc()).limit(limit).all()
+                # Find invoices without REAL line items
+                all_invoices = db.query(Invoice).order_by(Invoice.invoice_date.desc()).all()
+                invoices = []
+                for inv in all_invoices:
+                    if not self._has_real_line_items(db, inv.id):
+                        # Clear any junk line items
+                        db.query(InvoiceLineItem).filter_by(invoice_id=inv.id).delete()
+                        invoices.append(inv)
+                    if len(invoices) >= limit:
+                        break
+                db.commit()
 
             extracted = 0
             products_found = 0
@@ -230,12 +292,13 @@ class SyncService:
                 if not invoice.fortnox_id:
                     continue
 
-                logger.info(f'Extracting from invoice {invoice.fortnox_id} ({invoice.supplier_name})')
+                logger.info(f'Extracting products from invoice {invoice.fortnox_id} ({invoice.supplier_name})')
 
                 # Download PDF from Fortnox
                 pdf_bytes = self.fortnox.get_invoice_pdf(invoice.fortnox_id)
                 if not pdf_bytes:
-                    logger.warning(f'No PDF for invoice {invoice.fortnox_id}')
+                    logger.warning(f'No PDF found for invoice {invoice.fortnox_id}')
+                    # Create a placeholder line item so we don't retry
                     placeholder = InvoiceLineItem(
                         invoice_id=invoice.id,
                         description='[No PDF available]',
@@ -253,7 +316,7 @@ class SyncService:
                 )
 
                 if not products:
-                    logger.warning(f'No products from invoice {invoice.fortnox_id}')
+                    logger.warning(f'No products extracted from invoice {invoice.fortnox_id}')
                     placeholder = InvoiceLineItem(
                         invoice_id=invoice.id,
                         description='[Could not extract products from PDF]',
@@ -264,8 +327,10 @@ class SyncService:
                     errors += 1
                     continue
 
+                # Find supplier for linking products
                 supplier = db.query(Supplier).get(invoice.supplier_id) if invoice.supplier_id else None
 
+                # Store extracted products
                 for prod_data in products:
                     article_number = str(prod_data.get('article_number', '')) or None
                     description = prod_data.get('description', '')
@@ -274,15 +339,17 @@ class SyncService:
                     unit_price = prod_data.get('unit_price', 0) or 0
                     total = prod_data.get('total', 0) or 0
 
-                    # Find or create product
+                    # Try to find or create a product record
                     product = None
                     if article_number:
+                        # Look for existing product by article number + supplier
                         product = db.query(Product).filter_by(
                             fortnox_article_number=article_number,
                             supplier_id=supplier.id if supplier else None
                         ).first()
 
                         if not product:
+                            # Try without supplier filter
                             product = db.query(Product).filter_by(
                                 fortnox_article_number=article_number
                             ).first()
@@ -298,6 +365,7 @@ class SyncService:
                             db.add(product)
                             db.flush()
 
+                    # Create line item
                     line_item = InvoiceLineItem(
                         invoice_id=invoice.id,
                         product_id=product.id if product else None,
@@ -310,6 +378,7 @@ class SyncService:
                     )
                     db.add(line_item)
 
+                    # Create price history entry
                     if product and unit_price > 0:
                         price_entry = PriceHistory(
                             product_id=product.id,
@@ -326,7 +395,7 @@ class SyncService:
                 db.commit()
                 extracted += 1
 
-                # Rate limiting
+                # Rate limiting — be gentle with both Fortnox and Claude APIs
                 time.sleep(2)
 
             log.status = 'success'
