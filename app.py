@@ -25,11 +25,13 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-CORS(app)
+CORS(app)  # Allow Lovable frontend to connect
 
+# Initialize Fortnox client
 fortnox = FortnoxClient(Session)
 sync = SyncService(fortnox)
 
+# Create database tables on startup
 init_db()
 
 
@@ -38,7 +40,8 @@ init_db()
 SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_HOURS', 6)) * 3600
 
 def auto_sync():
-    time.sleep(60)
+    """Background thread that syncs Fortnox data on a schedule."""
+    time.sleep(60)  # Wait 1 min after startup before first auto-sync
     while True:
         try:
             if fortnox.is_connected():
@@ -51,6 +54,7 @@ def auto_sync():
             logger.error(f'Auto-sync error: {e}')
         time.sleep(SYNC_INTERVAL)
 
+# Start background sync thread (only in main process, not in reloader)
 if not DEBUG or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
     sync_thread = threading.Thread(target=auto_sync, daemon=True)
     sync_thread.start()
@@ -62,27 +66,30 @@ if not DEBUG or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 def health():
     return jsonify({
         'status': 'running',
-        'app': 'M.E.P \u2014 Mise en Place',
+        'app': 'Restaurant Manager API',
         'fortnox_connected': fortnox.is_connected(),
         'timestamp': datetime.utcnow().isoformat()
     })
 
 
-# ── OAuth2 Flow ──────────────────────────────────────────────────────
+# ── OAuth2 Flow (one-time setup) ──────────────────────────────────────
 
 @app.route('/auth/fortnox', methods=['GET'])
 def auth_fortnox():
+    """Redirect to Fortnox OAuth2 login page."""
     auth_url = fortnox.get_auth_url()
     return redirect(auth_url)
 
 
 @app.route('/auth/callback', methods=['GET'])
 def auth_callback():
+    """Handle Fortnox OAuth2 callback after user authorizes."""
     code = request.args.get('code')
     error = request.args.get('error')
 
     if error:
         return jsonify({'error': error, 'description': request.args.get('error_description')}), 400
+
     if not code:
         return jsonify({'error': 'No authorization code received'}), 400
 
@@ -99,6 +106,7 @@ def auth_callback():
 
 @app.route('/auth/status', methods=['GET'])
 def auth_status():
+    """Check if Fortnox is connected."""
     return jsonify({
         'connected': fortnox.is_connected(),
         'has_access_token': bool(fortnox.access_token),
@@ -111,18 +119,28 @@ def auth_status():
 
 @app.route('/api/sync', methods=['POST'])
 def sync_all():
+    """Trigger a full sync from Fortnox (suppliers + articles + invoices)."""
     if not fortnox.is_connected():
         return jsonify({'error': 'Fortnox not connected. Visit /auth/fortnox first.'}), 401
     results = sync.sync_all()
     return jsonify(results)
 
 
+@app.route('/api/sync/invoices', methods=['POST'])
+def sync_invoices():
+    """Sync only invoices from Fortnox."""
+    if not fortnox.is_connected():
+        return jsonify({'error': 'Fortnox not connected'}), 401
+    result = sync.sync_invoices()
+    return jsonify(result)
+
+
 @app.route('/api/extract', methods=['POST'])
 def extract_products():
     """
     Extract product data from invoice PDFs using Claude API.
-    Optional: ?invoice_id=123 for just one invoice.
-    Optional: ?limit=10 to control batch size (default 10).
+    Optional: ?invoice_id=123 to extract just one invoice.
+    Optional: ?limit=10 to control how many invoices to process (default 10).
     """
     if not fortnox.is_connected():
         return jsonify({'error': 'Fortnox not connected'}), 401
@@ -132,16 +150,19 @@ def extract_products():
     return jsonify(result)
 
 
-@app.route('/api/sync/invoices', methods=['POST'])
-def sync_invoices():
-    if not fortnox.is_connected():
-        return jsonify({'error': 'Fortnox not connected'}), 401
-    result = sync.sync_invoices()
+@app.route('/api/clear-junk-items', methods=['POST'])
+def clear_junk_items():
+    """
+    Clear accounting-entry line items that have no real product data.
+    Run this once to clean up before PDF extraction.
+    """
+    result = sync.clear_junk_line_items()
     return jsonify(result)
 
 
 @app.route('/api/sync/suppliers', methods=['POST'])
 def sync_suppliers_endpoint():
+    """Sync only suppliers from Fortnox."""
     if not fortnox.is_connected():
         return jsonify({'error': 'Fortnox not connected'}), 401
     result = sync.sync_suppliers()
@@ -150,6 +171,7 @@ def sync_suppliers_endpoint():
 
 @app.route('/api/sync/status', methods=['GET'])
 def sync_status():
+    """Get latest sync logs."""
     db = Session()
     try:
         logs = db.query(SyncLog).order_by(SyncLog.started_at.desc()).limit(20).all()
@@ -166,14 +188,16 @@ def sync_status():
         db.close()
 
 
-# ── Data Endpoints ───────────────────────────────────────────────────
+# ── Data Endpoints (for Lovable frontend) ─────────────────────────────
 
 @app.route('/api/invoices', methods=['GET'])
 def get_invoices():
+    """Get all invoices with optional filters."""
     db = Session()
     try:
         query = db.query(Invoice).order_by(Invoice.invoice_date.desc())
 
+        # Optional filters
         supplier_id = request.args.get('supplier_id')
         if supplier_id:
             query = query.filter(Invoice.supplier_id == int(supplier_id))
@@ -202,12 +226,14 @@ def get_invoices():
 
 @app.route('/api/invoices/<int:invoice_id>', methods=['GET'])
 def get_invoice_detail(invoice_id):
+    """Get single invoice with all line items."""
     db = Session()
     try:
         inv = db.query(Invoice).get(invoice_id)
         if not inv:
             return jsonify({'error': 'Invoice not found'}), 404
 
+        # Include raw Fortnox data if requested (for debugging)
         result = {
             'id': inv.id,
             'fortnox_id': inv.fortnox_id,
@@ -239,6 +265,7 @@ def get_invoice_detail(invoice_id):
 
 @app.route('/api/suppliers', methods=['GET'])
 def get_suppliers():
+    """Get all suppliers."""
     db = Session()
     try:
         suppliers = db.query(Supplier).order_by(Supplier.name).all()
@@ -259,6 +286,7 @@ def get_suppliers():
 
 @app.route('/api/products', methods=['GET'])
 def get_products():
+    """Get all products with current prices."""
     db = Session()
     try:
         products = db.query(Product).order_by(Product.name).all()
@@ -278,6 +306,7 @@ def get_products():
 
 @app.route('/api/price-history/<int:product_id>', methods=['GET'])
 def get_price_history(product_id):
+    """Get price history for a specific product."""
     db = Session()
     try:
         history = db.query(PriceHistory).filter_by(
@@ -295,6 +324,10 @@ def get_price_history(product_id):
 
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
+    """
+    Get price alerts — products where price changed >= 10% between
+    the two most recent invoices.
+    """
     db = Session()
     try:
         products = db.query(Product).all()
@@ -318,6 +351,7 @@ def get_alerts():
                         'date': history[0].date.strftime('%Y-%m-%d') if history[0].date else None
                     })
 
+        # Sort by largest change first
         alerts.sort(key=lambda x: abs(x['change_percent']), reverse=True)
         return jsonify(alerts)
     finally:
@@ -326,6 +360,7 @@ def get_alerts():
 
 @app.route('/api/dashboard', methods=['GET'])
 def get_dashboard():
+    """Dashboard summary data for the Lovable frontend."""
     db = Session()
     try:
         total_invoices = db.query(Invoice).count()
@@ -333,9 +368,11 @@ def get_dashboard():
         total_products = db.query(Product).count()
         unpaid_invoices = db.query(Invoice).filter_by(is_paid=False).count()
 
+        # Total spend
         from sqlalchemy import func
         total_spend = db.query(func.sum(Invoice.total_amount)).scalar() or 0
 
+        # Latest sync
         latest_sync = db.query(SyncLog).filter_by(
             status='success'
         ).order_by(SyncLog.completed_at.desc()).first()
