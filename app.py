@@ -40,7 +40,7 @@ init_db()
 SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_HOURS', 6)) * 3600
 
 def auto_sync():
-    """Background thread that syncs Fortnox data on a schedule."""
+    """Background thread that syncs Fortnox data + extracts PDFs on a schedule."""
     time.sleep(60)  # Wait 1 min after startup before first auto-sync
     while True:
         try:
@@ -48,6 +48,11 @@ def auto_sync():
                 logger.info('Auto-sync: starting Fortnox sync...')
                 results = sync.sync_all()
                 logger.info(f'Auto-sync complete: {results}')
+
+                # Extract products from any unprocessed invoice PDFs
+                logger.info('Auto-sync: extracting products from PDFs...')
+                extract_result = sync.extract_invoice_products(limit=20)
+                logger.info(f'Auto-sync extraction: {extract_result}')
             else:
                 logger.info('Auto-sync: Fortnox not connected, skipping.')
         except Exception as e:
