@@ -67,7 +67,7 @@ class FortnoxClient:
         params = {
             'client_id': FORTNOX_CLIENT_ID,
             'redirect_uri': FORTNOX_REDIRECT_URI,
-            'scope': 'supplierinvoice supplier article connectfile',
+            'scope': 'supplierinvoice supplier article connectfile archive',
             'state': 'restaurant-manager',
             'access_type': 'offline',
             'response_type': 'code',
