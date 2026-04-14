@@ -20,8 +20,7 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
 CORS(app)  # Allow Lovable frontend to connect
-app.register_blueprint(inventory_bp)
-app.register_blueprint(upload_bp)
+
 
 # Create database tables on startup (MUST happen before FortnoxClient)
 init_db()
