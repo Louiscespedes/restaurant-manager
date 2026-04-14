@@ -14,9 +14,6 @@ from models import (
 )
 from fortnox_client import FortnoxClient
 from sync_service import SyncService
-from inventory_routes import inventory_bp
-from upload_routes import upload_bp
-
 # ── App Setup ──────────────────────────────────────────────────────────
 
 app = Flask(__name__)
