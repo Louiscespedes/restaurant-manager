@@ -107,6 +107,9 @@ def list_recipes():
             query = query.filter(Recipe.category == category)
         recipes = query.all()
         return jsonify([recipe_to_dict(r, include_ingredients=False) for r in recipes])
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
     finally:
         db.close()
 
