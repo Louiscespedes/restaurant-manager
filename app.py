@@ -26,6 +26,32 @@ CORS(app)
 # Initialize database
 init_db()
 
+# Run lightweight migrations — add columns that may be missing from older schemas
+def run_migrations():
+    """Add new columns to existing tables if they don't exist yet."""
+    from sqlalchemy import text
+    db = Session()
+    try:
+        migrations = [
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR",
+            "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
+        ]
+        for sql in migrations:
+            try:
+                db.execute(text(sql))
+            except Exception as e:
+                logger.warning(f"Migration skipped: {e}")
+        db.commit()
+        logger.info("Database migrations complete")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Migration error: {e}")
+    finally:
+        db.close()
+
+run_migrations()
+
 # Import sync service after DB init
 from sync_service import sync_all, sync_status, start_auto_sync, re_extract_all_invoices, extract_invoice_products
 
@@ -186,7 +212,6 @@ def get_products():
         products = db.query(Product).order_by(Product.name).all()
         results = []
         for p in products:
-            # Get latest price change
             prices = db.query(PriceHistory).filter_by(
                 product_id=p.id
             ).order_by(PriceHistory.date.desc()).limit(2).all()
@@ -277,10 +302,8 @@ def search_products():
         if not q:
             return jsonify([])
 
-        # Get bilingual search terms from food dictionary
         search_terms = search_food_terms(q)
 
-        # Build search conditions
         conditions = []
         for term in search_terms:
             like_term = f"%{term}%"
@@ -288,7 +311,6 @@ def search_products():
             conditions.append(Product.category.ilike(like_term))
             conditions.append(Product.fortnox_article_number.ilike(like_term))
 
-        # Also search by supplier name
         q_like = f"%{q}%"
         matching_suppliers = db.query(Supplier.id).filter(
             Supplier.name.ilike(q_like)
@@ -316,7 +338,6 @@ def search_products():
                     ((latest_prices[0].price - latest_prices[1].price) / latest_prices[1].price) * 100, 1
                 )
 
-            # Calculate normalized per-kg price if we have package weight
             normalized_price_per_kg = None
             if prod.current_price and prod.current_price > 0:
                 unit_lower = (prod.unit or "").lower()
@@ -500,7 +521,6 @@ def get_alerts():
         days = request.args.get("days", 90, type=int)
         cutoff = datetime.utcnow() - timedelta(days=days)
 
-        # Get products with at least 2 price history entries
         products = db.query(Product).all()
         alerts = []
 
@@ -522,7 +542,6 @@ def get_alerts():
             change_pct = ((current.price - previous.price) / previous.price) * 100
 
             if abs(change_pct) >= threshold:
-                # Calculate normalized per-kg prices for comparison
                 normalized_current = None
                 normalized_previous = None
                 unit_lower = (product.unit or "").lower()
@@ -555,7 +574,6 @@ def get_alerts():
                     "previous_normalized_per_kg": normalized_previous
                 })
 
-        # Sort by biggest change first
         alerts.sort(key=lambda a: abs(a["change_percent"]), reverse=True)
 
         return jsonify(alerts)
@@ -573,17 +591,14 @@ def dashboard_stats():
         product_count = db.query(Product).count()
         invoice_count = db.query(Invoice).count()
 
-        # Total spend
         total_spend = db.query(func.sum(Invoice.total_amount)).scalar() or 0
 
-        # This month spend
         now = datetime.utcnow()
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         month_spend = db.query(func.sum(Invoice.total_amount)).filter(
             Invoice.invoice_date >= month_start
         ).scalar() or 0
 
-        # Products with price increases (last 90 days)
         price_alerts = 0
         products = db.query(Product).all()
         for p in products:
@@ -595,7 +610,6 @@ def dashboard_stats():
                 if change > 5:
                     price_alerts += 1
 
-        # Last sync info
         last_sync_log = db.query(SyncLog).filter_by(
             status="completed"
         ).order_by(SyncLog.completed_at.desc()).first()
