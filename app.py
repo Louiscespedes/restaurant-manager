@@ -1,402 +1,698 @@
 """
-Restaurant Manager API — Flask backend deployed on Railway.
-Connects to Fortnox for live invoice data, serves to Lovable frontend.
+Restaurant Manager API — Flask backend for price tracking, supplier management,
+and smart food search. Connects to Fortnox for invoice/supplier data.
 """
-from flask import Flask, jsonify, request, redirect
-from flask_cors import CORS
-from datetime import datetime
 import os
-import threading
-import time
 import logging
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, redirect
+from flask_cors import CORS
+from sqlalchemy import func, or_, extract
 
-from config import PORT, DEBUG, SECRET_KEY
 from models import (
-    init_db, Session, Supplier, Product, Invoice,
-    InvoiceLineItem, PriceHistory, SyncLog
+    Session, Base, engine, Supplier, Product, Invoice,
+    InvoiceLineItem, PriceHistory, SyncLog, FortnoxToken, init_db
 )
-from fortnox_client import FortnoxClient
-from sync_service import SyncService
+from config import FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET, FORTNOX_REDIRECT_URI
+from food_dictionary import search_food_terms
 
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── App Setup ──────────────────────────────────────────────────────────
-
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
-CORS(app)  # Allow Lovable frontend to connect
+CORS(app)
 
-# Initialize Fortnox client
-fortnox = FortnoxClient(Session)
-sync = SyncService(fortnox)
-
-# Create database tables on startup
+# Initialize database
 init_db()
 
-
-# ── Automatic Sync (runs every 6 hours) ──────────────────────────────
-
-SYNC_INTERVAL = int(os.environ.get('SYNC_INTERVAL_HOURS', 6)) * 3600
-
-def auto_sync():
-    """Background thread that syncs Fortnox data + extracts PDFs on a schedule."""
-    time.sleep(60)  # Wait 1 min after startup before first auto-sync
-    while True:
-        try:
-            if fortnox.is_connected():
-                logger.info('Auto-sync: starting Fortnox sync...')
-                results = sync.sync_all()
-                logger.info(f'Auto-sync complete: {results}')
-
-                # Extract products from any unprocessed invoice PDFs
-                logger.info('Auto-sync: extracting products from PDFs...')
-                extract_result = sync.extract_invoice_products(limit=20)
-                logger.info(f'Auto-sync extraction: {extract_result}')
-            else:
-                logger.info('Auto-sync: Fortnox not connected, skipping.')
-        except Exception as e:
-            logger.error(f'Auto-sync error: {e}')
-        time.sleep(SYNC_INTERVAL)
-
-# Start background sync thread (only in main process, not in reloader)
-if not DEBUG or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-    sync_thread = threading.Thread(target=auto_sync, daemon=True)
-    sync_thread.start()
+# Import sync service after DB init
+from sync_service import sync_all, sync_status, start_auto_sync, re_extract_all_invoices, extract_invoice_products
 
 
-# ── Health Check ───────────────────────────────────────────────────────
+# --- Health ---
 
-@app.route('/', methods=['GET'])
+@app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({
-        'status': 'running',
-        'app': 'Restaurant Manager API',
-        'fortnox_connected': fortnox.is_connected(),
-        'timestamp': datetime.utcnow().isoformat()
-    })
+    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
 
 
-# ── OAuth2 Flow (one-time setup) ──────────────────────────────────────
+# --- Fortnox OAuth ---
 
-@app.route('/auth/fortnox', methods=['GET'])
-def auth_fortnox():
-    """Redirect to Fortnox OAuth2 login page."""
-    auth_url = fortnox.get_auth_url()
-    return redirect(auth_url)
+@app.route("/api/fortnox/auth", methods=["GET"])
+def fortnox_auth():
+    """Redirect user to Fortnox OAuth authorization page."""
+    auth_url = (
+        f"https://apps.fortnox.se/oauth-v1/auth"
+        f"?client_id={FORTNOX_CLIENT_ID}"
+        f"&redirect_uri={FORTNOX_REDIRECT_URI}"
+        f"&scope=supplierinvoice%20supplier%20article"
+        f"&state=restaurant_manager"
+        f"&response_type=code"
+    )
+    return jsonify({"auth_url": auth_url})
 
 
-@app.route('/auth/callback', methods=['GET'])
-def auth_callback():
-    """Handle Fortnox OAuth2 callback after user authorizes."""
-    code = request.args.get('code')
-    error = request.args.get('error')
-
-    if error:
-        return jsonify({'error': error, 'description': request.args.get('error_description')}), 400
-
+@app.route("/api/fortnox/callback", methods=["GET"])
+def fortnox_callback():
+    """Handle OAuth callback from Fortnox — exchange code for tokens."""
+    code = request.args.get("code")
     if not code:
-        return jsonify({'error': 'No authorization code received'}), 400
+        return jsonify({"error": "No authorization code received"}), 400
 
+    import requests as http_requests
     try:
-        tokens = fortnox.exchange_code(code)
-        return jsonify({
-            'status': 'connected',
-            'message': 'Fortnox authorization successful! You can now sync data.',
-            'expires_in': tokens.get('expires_in', 3600)
-        })
+        response = http_requests.post(
+            "https://apps.fortnox.se/oauth-v1/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": FORTNOX_REDIRECT_URI
+            },
+            auth=(FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30
+        )
+        response.raise_for_status()
+        token_data = response.json()
+
+        # Store tokens
+        db = Session()
+        token = FortnoxToken(
+            access_token=token_data["access_token"],
+            refresh_token=token_data["refresh_token"],
+            expires_at=datetime.utcnow() + timedelta(seconds=token_data.get("expires_in", 3600))
+        )
+        db.add(token)
+        db.commit()
+        db.close()
+
+        logger.info("Fortnox OAuth tokens stored successfully")
+
+        # Redirect to frontend
+        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+        return redirect(f"{frontend_url}/settings?fortnox=connected")
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Fortnox OAuth error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route('/auth/status', methods=['GET'])
-def auth_status():
-    """Check if Fortnox is connected."""
-    return jsonify({
-        'connected': fortnox.is_connected(),
-        'has_access_token': bool(fortnox.access_token),
-        'has_refresh_token': bool(fortnox.refresh_token),
-        'token_expires_at': fortnox.expires_at.isoformat() if fortnox.expires_at else None
-    })
-
-
-# ── Sync Endpoints ────────────────────────────────────────────────────
-
-@app.route('/api/sync', methods=['POST'])
-def sync_all():
-    """Trigger a full sync from Fortnox (suppliers + articles + invoices)."""
-    if not fortnox.is_connected():
-        return jsonify({'error': 'Fortnox not connected. Visit /auth/fortnox first.'}), 401
-    results = sync.sync_all()
-    return jsonify(results)
-
-
-@app.route('/api/sync/invoices', methods=['POST'])
-def sync_invoices():
-    """Sync only invoices from Fortnox."""
-    if not fortnox.is_connected():
-        return jsonify({'error': 'Fortnox not connected'}), 401
-    result = sync.sync_invoices()
-    return jsonify(result)
-
-
-@app.route('/api/extract', methods=['POST'])
-def extract_products():
-    """
-    Extract product data from invoice PDFs using Claude API.
-    Optional: ?invoice_id=123 to extract just one invoice.
-    Optional: ?limit=10 to control how many invoices to process (default 10).
-    """
-    if not fortnox.is_connected():
-        return jsonify({'error': 'Fortnox not connected'}), 401
-    invoice_id = request.args.get('invoice_id', type=int)
-    limit = request.args.get('limit', 10, type=int)
-    result = sync.extract_invoice_products(invoice_id=invoice_id, limit=limit)
-    return jsonify(result)
-
-
-@app.route('/api/clear-junk-items', methods=['POST'])
-def clear_junk_items():
-    """
-    Clear accounting-entry line items that have no real product data.
-    Run this once to clean up before PDF extraction.
-    """
-    result = sync.clear_junk_line_items()
-    return jsonify(result)
-
-
-@app.route('/api/sync/suppliers', methods=['POST'])
-def sync_suppliers_endpoint():
-    """Sync only suppliers from Fortnox."""
-    if not fortnox.is_connected():
-        return jsonify({'error': 'Fortnox not connected'}), 401
-    result = sync.sync_suppliers()
-    return jsonify(result)
-
-
-@app.route('/api/sync/status', methods=['GET'])
-def sync_status():
-    """Get latest sync logs."""
+@app.route("/api/fortnox/status", methods=["GET"])
+def fortnox_status():
+    """Check if Fortnox is connected (has valid tokens)."""
     db = Session()
     try:
-        logs = db.query(SyncLog).order_by(SyncLog.started_at.desc()).limit(20).all()
-        return jsonify([{
-            'id': log.id,
-            'type': log.sync_type,
-            'status': log.status,
-            'records_synced': log.records_synced,
-            'error': log.error_message,
-            'started_at': log.started_at.isoformat() if log.started_at else None,
-            'completed_at': log.completed_at.isoformat() if log.completed_at else None
-        } for log in logs])
+        token = db.query(FortnoxToken).order_by(FortnoxToken.id.desc()).first()
+        if token:
+            return jsonify({
+                "connected": True,
+                "expires_at": token.expires_at.isoformat() if token.expires_at else None,
+                "updated_at": token.updated_at.isoformat() if token.updated_at else None
+            })
+        return jsonify({"connected": False})
     finally:
         db.close()
 
 
-# ── Data Endpoints (for Lovable frontend) ─────────────────────────────
+# --- Suppliers ---
 
-@app.route('/api/invoices', methods=['GET'])
-def get_invoices():
-    """Get all invoices with optional filters."""
-    db = Session()
-    try:
-        query = db.query(Invoice).order_by(Invoice.invoice_date.desc())
-
-        # Optional filters
-        supplier_id = request.args.get('supplier_id')
-        if supplier_id:
-            query = query.filter(Invoice.supplier_id == int(supplier_id))
-
-        limit = request.args.get('limit', 100, type=int)
-        query = query.limit(limit)
-
-        invoices = query.all()
-        return jsonify([{
-            'id': inv.id,
-            'fortnox_id': inv.fortnox_id,
-            'supplier_name': inv.supplier_name,
-            'invoice_number': inv.invoice_number,
-            'invoice_date': inv.invoice_date.strftime('%Y-%m-%d') if inv.invoice_date else None,
-            'due_date': inv.due_date.strftime('%Y-%m-%d') if inv.due_date else None,
-            'total_amount': inv.total_amount,
-            'vat_amount': inv.vat_amount,
-            'currency': inv.currency,
-            'is_paid': inv.is_paid,
-            'synced_at': inv.synced_at.isoformat() if inv.synced_at else None,
-            'line_items_count': len(inv.line_items)
-        } for inv in invoices])
-    finally:
-        db.close()
-
-
-@app.route('/api/invoices/<int:invoice_id>', methods=['GET'])
-def get_invoice_detail(invoice_id):
-    """Get single invoice with all line items."""
-    db = Session()
-    try:
-        inv = db.query(Invoice).get(invoice_id)
-        if not inv:
-            return jsonify({'error': 'Invoice not found'}), 404
-
-        # Include raw Fortnox data if requested (for debugging)
-        result = {
-            'id': inv.id,
-            'fortnox_id': inv.fortnox_id,
-            'supplier_name': inv.supplier_name,
-            'invoice_number': inv.invoice_number,
-            'invoice_date': inv.invoice_date.strftime('%Y-%m-%d') if inv.invoice_date else None,
-            'due_date': inv.due_date.strftime('%Y-%m-%d') if inv.due_date else None,
-            'total_amount': inv.total_amount,
-            'vat_amount': inv.vat_amount,
-            'currency': inv.currency,
-            'is_paid': inv.is_paid,
-            'line_items': [{
-                'id': li.id,
-                'article_number': li.article_number,
-                'description': li.description,
-                'quantity': li.quantity,
-                'unit': li.unit,
-                'unit_price': li.unit_price,
-                'total': li.total
-            } for li in inv.line_items]
-        }
-        if request.args.get('raw'):
-            import json
-            result['fortnox_raw'] = json.loads(inv.fortnox_raw) if inv.fortnox_raw else None
-        return jsonify(result)
-    finally:
-        db.close()
-
-
-@app.route('/api/suppliers', methods=['GET'])
+@app.route("/api/suppliers", methods=["GET"])
 def get_suppliers():
-    """Get all suppliers."""
     db = Session()
     try:
         suppliers = db.query(Supplier).order_by(Supplier.name).all()
         return jsonify([{
-            'id': sup.id,
-            'fortnox_id': sup.fortnox_id,
-            'name': sup.name,
-            'email': sup.email,
-            'phone': sup.phone,
-            'city': sup.city,
-            'org_number': sup.org_number,
-            'invoice_count': len(sup.invoices),
-            'product_count': len(sup.products)
-        } for sup in suppliers])
+            "id": s.id,
+            "fortnox_id": s.fortnox_id,
+            "name": s.name,
+            "email": s.email,
+            "phone": s.phone,
+            "city": s.city,
+            "org_number": s.org_number,
+            "product_count": db.query(Product).filter_by(supplier_id=s.id).count(),
+            "invoice_count": db.query(Invoice).filter_by(supplier_id=s.id).count()
+        } for s in suppliers])
     finally:
         db.close()
 
 
-@app.route('/api/products', methods=['GET'])
+@app.route("/api/suppliers/<int:supplier_id>", methods=["GET"])
+def get_supplier(supplier_id):
+    db = Session()
+    try:
+        s = db.query(Supplier).filter_by(id=supplier_id).first()
+        if not s:
+            return jsonify({"error": "Supplier not found"}), 404
+
+        products = db.query(Product).filter_by(supplier_id=s.id).all()
+        invoices = db.query(Invoice).filter_by(supplier_id=s.id).order_by(Invoice.invoice_date.desc()).limit(20).all()
+
+        return jsonify({
+            "id": s.id,
+            "fortnox_id": s.fortnox_id,
+            "name": s.name,
+            "email": s.email,
+            "phone": s.phone,
+            "address": s.address,
+            "city": s.city,
+            "zip_code": s.zip_code,
+            "org_number": s.org_number,
+            "products": [{
+                "id": p.id,
+                "name": p.name,
+                "unit": p.unit,
+                "current_price": p.current_price,
+                "category": p.category
+            } for p in products],
+            "invoices": [{
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+                "total_amount": inv.total_amount,
+                "is_paid": inv.is_paid
+            } for inv in invoices]
+        })
+    finally:
+        db.close()
+
+
+# --- Products ---
+
+@app.route("/api/products", methods=["GET"])
 def get_products():
-    """Get all products with current prices."""
     db = Session()
     try:
         products = db.query(Product).order_by(Product.name).all()
-        return jsonify([{
-            'id': prod.id,
-            'name': prod.name,
-            'article_number': prod.fortnox_article_number,
-            'supplier_id': prod.supplier_id,
-            'supplier_name': prod.supplier.name if prod.supplier else None,
-            'unit': prod.unit,
-            'category': prod.category,
-            'current_price': prod.current_price
-        } for prod in products])
+        results = []
+        for p in products:
+            # Get latest price change
+            prices = db.query(PriceHistory).filter_by(
+                product_id=p.id
+            ).order_by(PriceHistory.date.desc()).limit(2).all()
+
+            price_change = None
+            if len(prices) >= 2 and prices[1].price > 0:
+                price_change = round(
+                    ((prices[0].price - prices[1].price) / prices[1].price) * 100, 1
+                )
+
+            results.append({
+                "id": p.id,
+                "name": p.name,
+                "article_number": p.fortnox_article_number,
+                "supplier_id": p.supplier_id,
+                "supplier_name": p.supplier.name if p.supplier else None,
+                "unit": p.unit,
+                "current_price": p.current_price,
+                "category": p.category,
+                "package_weight_grams": p.package_weight_grams,
+                "price_change_percent": price_change
+            })
+        return jsonify(results)
     finally:
         db.close()
 
 
-@app.route('/api/price-history/<int:product_id>', methods=['GET'])
+@app.route("/api/products/<int:product_id>", methods=["GET"])
+def get_product(product_id):
+    db = Session()
+    try:
+        p = db.query(Product).filter_by(id=product_id).first()
+        if not p:
+            return jsonify({"error": "Product not found"}), 404
+
+        price_history = db.query(PriceHistory).filter_by(
+            product_id=p.id
+        ).order_by(PriceHistory.date.desc()).all()
+
+        return jsonify({
+            "id": p.id,
+            "name": p.name,
+            "article_number": p.fortnox_article_number,
+            "supplier_id": p.supplier_id,
+            "supplier_name": p.supplier.name if p.supplier else None,
+            "unit": p.unit,
+            "current_price": p.current_price,
+            "category": p.category,
+            "package_weight_grams": p.package_weight_grams,
+            "price_history": [{
+                "price": ph.price,
+                "date": ph.date.isoformat() if ph.date else None,
+                "invoice_number": ph.invoice_number
+            } for ph in price_history]
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/products/<int:product_id>/price-history", methods=["GET"])
 def get_price_history(product_id):
-    """Get price history for a specific product."""
     db = Session()
     try:
         history = db.query(PriceHistory).filter_by(
             product_id=product_id
-        ).order_by(PriceHistory.date.desc()).all()
+        ).order_by(PriceHistory.date.asc()).all()
 
         return jsonify([{
-            'price': h.price,
-            'date': h.date.strftime('%Y-%m-%d') if h.date else None,
-            'invoice_number': h.invoice_number
+            "price": h.price,
+            "date": h.date.isoformat() if h.date else None,
+            "invoice_number": h.invoice_number
         } for h in history])
     finally:
         db.close()
 
 
-@app.route('/api/alerts', methods=['GET'])
-def get_alerts():
+# --- Smart Search (Bilingual) ---
+
+@app.route("/api/search", methods=["GET"])
+def search_products():
     """
-    Get price alerts — products where price changed >= 10% between
-    the two most recent invoices.
+    Smart bilingual search — search in English or Swedish, find products in both.
+    ?q=carrot finds morrot products and vice versa.
     """
     db = Session()
     try:
-        products = db.query(Product).all()
-        alerts = []
+        q = request.args.get("q", "").strip()
+        if not q:
+            return jsonify([])
 
+        # Get bilingual search terms from food dictionary
+        search_terms = search_food_terms(q)
+
+        # Build search conditions
+        conditions = []
+        for term in search_terms:
+            like_term = f"%{term}%"
+            conditions.append(Product.name.ilike(like_term))
+            conditions.append(Product.category.ilike(like_term))
+            conditions.append(Product.fortnox_article_number.ilike(like_term))
+
+        # Also search by supplier name
+        q_like = f"%{q}%"
+        matching_suppliers = db.query(Supplier.id).filter(
+            Supplier.name.ilike(q_like)
+        ).all()
+        supplier_ids = [s.id for s in matching_suppliers]
+        if supplier_ids:
+            conditions.append(Product.supplier_id.in_(supplier_ids))
+
+        if not conditions:
+            return jsonify([])
+
+        products = db.query(Product).filter(
+            or_(*conditions)
+        ).order_by(Product.name).limit(50).all()
+
+        results = []
         for prod in products:
-            history = db.query(PriceHistory).filter_by(
+            latest_prices = db.query(PriceHistory).filter_by(
                 product_id=prod.id
             ).order_by(PriceHistory.date.desc()).limit(2).all()
 
-            if len(history) >= 2 and history[1].price > 0:
-                change = ((history[0].price - history[1].price) / history[1].price) * 100
-                if abs(change) >= 10:
-                    alerts.append({
-                        'product_id': prod.id,
-                        'product': prod.name,
-                        'supplier': prod.supplier.name if prod.supplier else None,
-                        'change_percent': round(change, 1),
-                        'old_price': history[1].price,
-                        'new_price': history[0].price,
-                        'date': history[0].date.strftime('%Y-%m-%d') if history[0].date else None
-                    })
+            price_change = None
+            if len(latest_prices) >= 2 and latest_prices[1].price > 0:
+                price_change = round(
+                    ((latest_prices[0].price - latest_prices[1].price) / latest_prices[1].price) * 100, 1
+                )
 
-        # Sort by largest change first
-        alerts.sort(key=lambda x: abs(x['change_percent']), reverse=True)
-        return jsonify(alerts)
+            # Calculate normalized per-kg price if we have package weight
+            normalized_price_per_kg = None
+            if prod.current_price and prod.current_price > 0:
+                unit_lower = (prod.unit or "").lower()
+                if unit_lower == "kg":
+                    normalized_price_per_kg = prod.current_price
+                elif unit_lower in ("g", "gram"):
+                    normalized_price_per_kg = prod.current_price * 1000
+                elif prod.package_weight_grams and prod.package_weight_grams > 0:
+                    normalized_price_per_kg = round(
+                        prod.current_price / (prod.package_weight_grams / 1000), 2
+                    )
+
+            results.append({
+                "id": prod.id,
+                "name": prod.name,
+                "article_number": prod.fortnox_article_number,
+                "supplier_id": prod.supplier_id,
+                "supplier_name": prod.supplier.name if prod.supplier else None,
+                "unit": prod.unit,
+                "category": prod.category,
+                "current_price": prod.current_price,
+                "package_weight_grams": prod.package_weight_grams,
+                "normalized_price_per_kg": normalized_price_per_kg,
+                "price_change_percent": price_change,
+                "matched_terms": list(search_terms)[:5]
+            })
+
+        return jsonify(results)
     finally:
         db.close()
 
 
-@app.route('/api/dashboard', methods=['GET'])
-def get_dashboard():
-    """Dashboard summary data for the Lovable frontend."""
+# --- Invoices ---
+
+@app.route("/api/invoices", methods=["GET"])
+def get_invoices():
     db = Session()
     try:
-        total_invoices = db.query(Invoice).count()
-        total_suppliers = db.query(Supplier).count()
-        total_products = db.query(Product).count()
-        unpaid_invoices = db.query(Invoice).filter_by(is_paid=False).count()
+        page = request.args.get("page", 1, type=int)
+        per_page = request.args.get("per_page", 50, type=int)
+        supplier_id = request.args.get("supplier_id", type=int)
 
-        # Total spend
-        from sqlalchemy import func
-        total_spend = db.query(func.sum(Invoice.total_amount)).scalar() or 0
+        query = db.query(Invoice).order_by(Invoice.invoice_date.desc())
 
-        # Latest sync
-        latest_sync = db.query(SyncLog).filter_by(
-            status='success'
-        ).order_by(SyncLog.completed_at.desc()).first()
+        if supplier_id:
+            query = query.filter_by(supplier_id=supplier_id)
+
+        total = query.count()
+        invoices = query.offset((page - 1) * per_page).limit(per_page).all()
 
         return jsonify({
-            'total_invoices': total_invoices,
-            'total_suppliers': total_suppliers,
-            'total_products': total_products,
-            'unpaid_invoices': unpaid_invoices,
-            'total_spend': round(total_spend, 2),
-            'currency': 'SEK',
-            'last_sync': latest_sync.completed_at.isoformat() if latest_sync else None,
-            'fortnox_connected': fortnox.is_connected()
+            "invoices": [{
+                "id": inv.id,
+                "fortnox_id": inv.fortnox_id,
+                "supplier_name": inv.supplier_name,
+                "supplier_id": inv.supplier_id,
+                "invoice_number": inv.invoice_number,
+                "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+                "due_date": inv.due_date.isoformat() if inv.due_date else None,
+                "total_amount": inv.total_amount,
+                "is_paid": inv.is_paid,
+                "line_item_count": db.query(InvoiceLineItem).filter_by(invoice_id=inv.id).count()
+            } for inv in invoices],
+            "total": total,
+            "page": page,
+            "per_page": per_page
         })
     finally:
         db.close()
 
 
-# ── Run ────────────────────────────────────────────────────────────────
+@app.route("/api/invoices/<int:invoice_id>", methods=["GET"])
+def get_invoice(invoice_id):
+    db = Session()
+    try:
+        inv = db.query(Invoice).filter_by(id=invoice_id).first()
+        if not inv:
+            return jsonify({"error": "Invoice not found"}), 404
 
-if __name__ == '__main__':
-    app.run(debug=DEBUG, host='0.0.0.0', port=PORT)
+        line_items = db.query(InvoiceLineItem).filter_by(invoice_id=inv.id).all()
+
+        return jsonify({
+            "id": inv.id,
+            "fortnox_id": inv.fortnox_id,
+            "supplier_name": inv.supplier_name,
+            "supplier_id": inv.supplier_id,
+            "invoice_number": inv.invoice_number,
+            "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+            "due_date": inv.due_date.isoformat() if inv.due_date else None,
+            "total_amount": inv.total_amount,
+            "vat_amount": inv.vat_amount,
+            "currency": inv.currency,
+            "is_paid": inv.is_paid,
+            "line_items": [{
+                "id": li.id,
+                "article_number": li.article_number,
+                "description": li.description,
+                "quantity": li.quantity,
+                "unit": li.unit,
+                "unit_price": li.unit_price,
+                "total": li.total,
+                "package_weight_grams": li.package_weight_grams,
+                "product_id": li.product_id
+            } for li in line_items]
+        })
+    finally:
+        db.close()
+
+
+# --- Spend Analytics ---
+
+@app.route("/api/spend/by-month", methods=["GET"])
+def spend_by_month():
+    """Monthly spend totals — for the spend chart on the dashboard."""
+    db = Session()
+    try:
+        months = request.args.get("months", 12, type=int)
+        cutoff = datetime.utcnow() - timedelta(days=months * 31)
+
+        results = db.query(
+            extract("year", Invoice.invoice_date).label("year"),
+            extract("month", Invoice.invoice_date).label("month"),
+            func.sum(Invoice.total_amount).label("total"),
+            func.count(Invoice.id).label("invoice_count")
+        ).filter(
+            Invoice.invoice_date >= cutoff,
+            Invoice.total_amount.isnot(None)
+        ).group_by("year", "month").order_by("year", "month").all()
+
+        return jsonify([{
+            "year": int(r.year),
+            "month": int(r.month),
+            "total": round(float(r.total), 2),
+            "invoice_count": r.invoice_count
+        } for r in results])
+    finally:
+        db.close()
+
+
+@app.route("/api/spend/by-supplier", methods=["GET"])
+def spend_by_supplier():
+    """Spend broken down by supplier — for the dashboard pie chart."""
+    db = Session()
+    try:
+        months = request.args.get("months", 12, type=int)
+        cutoff = datetime.utcnow() - timedelta(days=months * 31)
+
+        results = db.query(
+            Invoice.supplier_name,
+            Invoice.supplier_id,
+            func.sum(Invoice.total_amount).label("total"),
+            func.count(Invoice.id).label("invoice_count")
+        ).filter(
+            Invoice.invoice_date >= cutoff,
+            Invoice.total_amount.isnot(None)
+        ).group_by(
+            Invoice.supplier_name, Invoice.supplier_id
+        ).order_by(func.sum(Invoice.total_amount).desc()).all()
+
+        return jsonify([{
+            "supplier_name": r.supplier_name,
+            "supplier_id": r.supplier_id,
+            "total": round(float(r.total), 2),
+            "invoice_count": r.invoice_count
+        } for r in results])
+    finally:
+        db.close()
+
+
+# --- Price Alerts ---
+
+@app.route("/api/alerts", methods=["GET"])
+def get_alerts():
+    """
+    Smart price alerts — detects significant price changes.
+    Supports unit normalization (compares per-kg prices when package_weight is known).
+    """
+    db = Session()
+    try:
+        threshold = request.args.get("threshold", 5.0, type=float)
+        days = request.args.get("days", 90, type=int)
+        cutoff = datetime.utcnow() - timedelta(days=days)
+
+        # Get products with at least 2 price history entries
+        products = db.query(Product).all()
+        alerts = []
+
+        for product in products:
+            prices = db.query(PriceHistory).filter(
+                PriceHistory.product_id == product.id,
+                PriceHistory.date >= cutoff
+            ).order_by(PriceHistory.date.desc()).limit(10).all()
+
+            if len(prices) < 2:
+                continue
+
+            current = prices[0]
+            previous = prices[1]
+
+            if previous.price <= 0:
+                continue
+
+            change_pct = ((current.price - previous.price) / previous.price) * 100
+
+            if abs(change_pct) >= threshold:
+                # Calculate normalized per-kg prices for comparison
+                normalized_current = None
+                normalized_previous = None
+                unit_lower = (product.unit or "").lower()
+
+                if unit_lower == "kg":
+                    normalized_current = current.price
+                    normalized_previous = previous.price
+                elif unit_lower in ("g", "gram"):
+                    normalized_current = current.price * 1000
+                    normalized_previous = previous.price * 1000
+                elif product.package_weight_grams and product.package_weight_grams > 0:
+                    kg_factor = product.package_weight_grams / 1000
+                    normalized_current = round(current.price / kg_factor, 2)
+                    normalized_previous = round(previous.price / kg_factor, 2)
+
+                alerts.append({
+                    "product_id": product.id,
+                    "product_name": product.name,
+                    "supplier_name": product.supplier.name if product.supplier else None,
+                    "unit": product.unit,
+                    "current_price": current.price,
+                    "previous_price": previous.price,
+                    "change_percent": round(change_pct, 1),
+                    "direction": "up" if change_pct > 0 else "down",
+                    "date": current.date.isoformat() if current.date else None,
+                    "previous_date": previous.date.isoformat() if previous.date else None,
+                    "invoice_number": current.invoice_number,
+                    "package_weight_grams": product.package_weight_grams,
+                    "normalized_price_per_kg": normalized_current,
+                    "previous_normalized_per_kg": normalized_previous
+                })
+
+        # Sort by biggest change first
+        alerts.sort(key=lambda a: abs(a["change_percent"]), reverse=True)
+
+        return jsonify(alerts)
+    finally:
+        db.close()
+
+
+# --- Dashboard Stats ---
+
+@app.route("/api/dashboard/stats", methods=["GET"])
+def dashboard_stats():
+    db = Session()
+    try:
+        supplier_count = db.query(Supplier).count()
+        product_count = db.query(Product).count()
+        invoice_count = db.query(Invoice).count()
+
+        # Total spend
+        total_spend = db.query(func.sum(Invoice.total_amount)).scalar() or 0
+
+        # This month spend
+        now = datetime.utcnow()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_spend = db.query(func.sum(Invoice.total_amount)).filter(
+            Invoice.invoice_date >= month_start
+        ).scalar() or 0
+
+        # Products with price increases (last 90 days)
+        price_alerts = 0
+        products = db.query(Product).all()
+        for p in products:
+            prices = db.query(PriceHistory).filter_by(
+                product_id=p.id
+            ).order_by(PriceHistory.date.desc()).limit(2).all()
+            if len(prices) >= 2 and prices[1].price > 0:
+                change = ((prices[0].price - prices[1].price) / prices[1].price) * 100
+                if change > 5:
+                    price_alerts += 1
+
+        # Last sync info
+        last_sync_log = db.query(SyncLog).filter_by(
+            status="completed"
+        ).order_by(SyncLog.completed_at.desc()).first()
+
+        return jsonify({
+            "suppliers": supplier_count,
+            "products": product_count,
+            "invoices": invoice_count,
+            "total_spend": round(float(total_spend), 2),
+            "month_spend": round(float(month_spend), 2),
+            "price_alerts": price_alerts,
+            "last_sync": last_sync_log.completed_at.isoformat() if last_sync_log and last_sync_log.completed_at else None,
+            "sync_status": sync_status
+        })
+    finally:
+        db.close()
+
+
+# --- Sync Controls ---
+
+@app.route("/api/sync", methods=["POST"])
+def trigger_sync():
+    """Trigger a manual full sync."""
+    import threading
+    if sync_status["is_syncing"]:
+        return jsonify({"message": "Sync already in progress", "status": sync_status}), 409
+
+    thread = threading.Thread(target=sync_all, daemon=True)
+    thread.start()
+    return jsonify({"message": "Sync started", "status": sync_status})
+
+
+@app.route("/api/sync/status", methods=["GET"])
+def get_sync_status():
+    return jsonify(sync_status)
+
+
+@app.route("/api/sync/history", methods=["GET"])
+def sync_history():
+    db = Session()
+    try:
+        logs = db.query(SyncLog).order_by(SyncLog.started_at.desc()).limit(20).all()
+        return jsonify([{
+            "id": log.id,
+            "sync_type": log.sync_type,
+            "status": log.status,
+            "records_synced": log.records_synced,
+            "error_message": log.error_message,
+            "started_at": log.started_at.isoformat() if log.started_at else None,
+            "completed_at": log.completed_at.isoformat() if log.completed_at else None
+        } for log in logs])
+    finally:
+        db.close()
+
+
+# --- Re-extract (backfill package weights) ---
+
+@app.route("/api/re-extract", methods=["POST"])
+def trigger_re_extract():
+    """
+    Re-extract all invoice PDFs to backfill package_weight_grams.
+    This clears existing line items and re-processes every invoice.
+    Use with caution — takes a long time and costs API credits.
+    """
+    import threading
+    if sync_status["is_syncing"]:
+        return jsonify({"message": "Sync/extraction already in progress", "status": sync_status}), 409
+
+    invoice_id = request.json.get("invoice_id") if request.is_json else None
+
+    def _run():
+        sync_status["is_syncing"] = True
+        sync_status["progress"] = "Re-extracting invoices..."
+        try:
+            if invoice_id:
+                count = extract_invoice_products(invoice_id=invoice_id, force=True)
+            else:
+                count = re_extract_all_invoices()
+            sync_status["products_extracted"] = count
+            sync_status["progress"] = f"Re-extraction complete! {count} products extracted."
+        except Exception as e:
+            sync_status["last_error"] = str(e)
+            sync_status["progress"] = f"Re-extraction failed: {e}"
+        finally:
+            sync_status["is_syncing"] = False
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    msg = f"Re-extracting invoice {invoice_id}" if invoice_id else "Re-extracting ALL invoices"
+    return jsonify({"message": msg, "status": sync_status})
+
+
+# --- Start ---
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"Starting Restaurant Manager API on port {port}")
+    start_auto_sync()
+    app.run(host="0.0.0.0", port=port, debug=False)
