@@ -11,7 +11,9 @@ from sqlalchemy import func, or_, extract
 
 from models import (
     Session, Base, engine, Supplier, Product, Invoice,
-    InvoiceLineItem, PriceHistory, SyncLog, FortnoxToken, init_db
+    InvoiceLineItem, PriceHistory, SyncLog, FortnoxToken, init_db,
+    Recipe, RecipeIngredient, Dish, DishComponent, Menu, MenuItem,
+    Inventory, InventoryItem
 )
 from config import FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET, FORTNOX_REDIRECT_URI
 from food_dictionary import search_food_terms
@@ -51,6 +53,14 @@ def run_migrations():
         db.close()
 
 run_migrations()
+
+# Register recipe/dish/menu routes
+from recipe_routes import recipe_bp
+app.register_blueprint(recipe_bp)
+
+# Register inventory routes
+from inventory_routes import inventory_bp
+app.register_blueprint(inventory_bp)
 
 # Import sync service after DB init
 from sync_service import sync_all, sync_status, start_auto_sync, re_extract_all_invoices, extract_invoice_products
