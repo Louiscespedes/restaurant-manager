@@ -331,9 +331,9 @@ INVENTORY TEXT:
 {raw_text}
 
 Return JSON:
-{{{{
+{{
   "items": [
-    {{{{
+    {{
       "description": "clean product name",
       "quantity": number,
       "unit": "kg, g, liter, st, etc.",
@@ -346,9 +346,9 @@ Return JSON:
       "matched_recipe_name": "recipe name if this is a finished product, or null",
       "needs_clarification": true/false,
       "clarification_question": "question for user, or null"
-    }}}}
+    }}
   ]
-}}}}
+}}
 
 Rules:
 - Match products across languages: morötter = carrots = carottes

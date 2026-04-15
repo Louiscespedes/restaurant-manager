@@ -301,12 +301,12 @@ RECIPE TEXT:
 {raw_text}
 
 Return a JSON object with this structure:
-{{{{
+{{
   "name": "recipe name (inferred from the text)",
   "category": "one of: sauce, pastry, garnish, base, main, dessert, other",
   "portions": number or null,
   "ingredients": [
-    {{{{
+    {{
       "description": "clean ingredient name",
       "quantity": number,
       "unit": "kg, g, liter, cl, ml, st, etc. (normalized)",
@@ -315,9 +315,9 @@ Return a JSON object with this structure:
       "needs_clarification": true/false,
       "clarification_question": "question to ask the user if needs_clarification is true, e.g. 'Which supplier for carrots: Sorunda or Menigo?'",
       "suggested_trimming_percent": number or 0
-    }}}}
+    }}
   ]
-}}}}
+}}
 
 Be smart about matching:
 - "morötter" = "carrots" = "carottes" — match across languages
