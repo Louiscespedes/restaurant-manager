@@ -1,4 +1,448 @@
 """
+Sync Service — orchestrates data flow from Fortnox into the local database.
+Syncs suppliers, invoices, and extracts product line items from invoice PDFs.
+Runs auto-sync on startup and provides manual sync triggers.
+"""
+import logging
+import threading
+from datetime import datetime, timedelta
+from sqlalchemy import func
+
+from models import (
+    Session, Supplier, Product, Invoice, InvoiceLineItem,
+    PriceHistory, SyncLog, FortnoxToken, init_db
+)
+from fortnox_client import FortnoxClient
+from pdf_extractor import extract_products_from_pdf
+
+logger = logging.getLogger(__name__)
+
+# Global sync state
+sync_status = {
+    'is_syncing': False,
+    'last_sync': None,
+    'last_error': None,
+    'suppliers_synced': 0,
+    'invoices_synced': 0,
+    'products_extracted': 0,
+    'progress': ''
+}
+
+
+def get_fortnox_client():
+    """Get a FortnoxClient with stored tokens."""
+    db = Session()
+    try:
+        token = db.query(FortnoxToken).order_by(FortnoxToken.id.desc()).first()
+        if not token:
+            logger.warning('No Fortnox token found — cannot sync')
+            return None
+        client = FortnoxClient(
+            access_token=token.access_token,
+            refresh_token=token.refresh_token
+        )
+        return client
+    finally:
+        db.close()
+
+
+def update_stored_tokens(client):
+    """Save refreshed tokens back to database."""
+    db = Session()
+    try:
+        token = db.query(FortnoxToken).order_by(FortnoxToken.id.desc()).first()
+        if token and client.access_token:
+            token.access_token = client.access_token
+            token.refresh_token = client.refresh_token
+            token.updated_at = datetime.utcnow()
+            db.commit()
+            logger.info('Updated stored Fortnox tokens')
+    except Exception as e:
+        db.rollback()
+        logger.error(f'Error updating tokens: {e}')
+    finally:
+        db.close()
+
+
+def sync_suppliers():
+    """Sync suppliers from Fortnox into local database."""
+    sync_status['progress'] = 'Syncing suppliers...'
+    client = get_fortnox_client()
+    if not client:
+        return 0
+
+    db = Session()
+    count = 0
+    try:
+        suppliers_data = client.get_suppliers()
+        update_stored_tokens(client)
+
+        for s in suppliers_data:
+            fortnox_id = str(s.get('SupplierNumber', ''))
+            name = s.get('Name', 'Unknown')
+
+            existing = db.query(Supplier).filter_by(fortnox_id=fortnox_id).first()
+            if existing:
+                existing.name = name
+                existing.email = s.get('Email', existing.email)
+                existing.phone = s.get('Phone1', existing.phone)
+                existing.address = s.get('Address1', existing.address)
+                existing.city = s.get('City', existing.city)
+                existing.zip_code = s.get('ZipCode', existing.zip_code)
+                existing.org_number = s.get('OrganisationNumber', existing.org_number)
+                existing.updated_at = datetime.utcnow()
+            else:
+                supplier = Supplier(
+                    fortnox_id=fortnox_id,
+                    name=name,
+                    email=s.get('Email'),
+                    phone=s.get('Phone1'),
+                    address=s.get('Address1'),
+                    city=s.get('City'),
+                    zip_code=s.get('ZipCode'),
+                    org_number=s.get('OrganisationNumber')
+                )
+                db.add(supplier)
+            count += 1
+
+        db.commit()
+        logger.info(f'Synced {count} suppliers from Fortnox')
+    except Exception as e:
+        db.rollback()
+        logger.error(f'Error syncing suppliers: {e}')
+        raise
+    finally:
+        db.close()
+
+    return count
+
+
+def sync_invoices():
+    """Sync supplier invoices from Fortnox into local database."""
+    sync_status['progress'] = 'Syncing invoices...'
+    client = get_fortnox_client()
+    if not client:
+        return 0
+
+    db = Session()
+    count = 0
+    try:
+        invoices_data = client.get_supplier_invoices()
+        update_stored_tokens(client)
+
+        for inv in invoices_data:
+            fortnox_id = str(inv.get('GivenNumber', inv.get('InvoiceNumber', '')))
+            
+            existing = db.query(Invoice).filter_by(fortnox_id=fortnox_id).first()
+            if existing:
+                existing.total_amount = inv.get('Total', existing.total_amount)
+                existing.is_paid = inv.get('Balance', 0) == 0
+                existing.updated_at = datetime.utcnow()
+                count += 1
+                continue
+
+            supplier_number = str(inv.get('SupplierNumber', ''))
+            supplier_name = inv.get('SupplierName', 'Unknown')
+            supplier = db.query(Supplier).filter_by(fortnox_id=supplier_number).first()
+
+            invoice_date = None
+            due_date = None
+            try:
+                if inv.get('InvoiceDate'):
+                    invoice_date = datetime.strptime(inv['InvoiceDate'], '%Y-%m-%d')
+                if inv.get('DueDate'):
+                    due_date = datetime.strptime(inv['DueDate'], '%Y-%m-%d')
+            except (ValueError, TypeError):
+                pass
+
+            invoice = Invoice(
+                fortnox_id=fortnox_id,
+                supplier_id=supplier.id if supplier else None,
+                supplier_name=supplier_name,
+                invoice_number=inv.get('InvoiceNumber', fortnox_id),
+                invoice_date=invoice_date,
+                due_date=due_date,
+                total_amount=inv.get('Total'),
+                vat_amount=inv.get('VAT'),
+                currency=inv.get('Currency', 'SEK'),
+                is_paid=inv.get('Balance', 0) == 0,
+                fortnox_raw=str(inv),
+                synced_at=datetime.utcnow()
+            )
+            db.add(invoice)
+            db.flush()
+
+            count += 1
+
+        db.commit()
+        logger.info(f'Synced {count} invoices from Fortnox')
+    except Exception as e:
+        db.rollback()
+        logger.error(f'Error syncing invoices: {e}')
+        raise
+    finally:
+        db.close()
+
+    return count
+
+
+def extract_invoice_products(invoice_id=None, force=False):
+    """
+    Extract product line items from invoice PDFs using Claude API.
+    If invoice_id is given, extract for that invoice only.
+    If force=True, re-extract even if line items already exist.
+    """
+    sync_status['progress'] = 'Extracting products from invoices...'
+    client = get_fortnox_client()
+    if not client:
+        return 0
+
+    db = Session()
+    total_products = 0
+    try:
+        if invoice_id:
+            invoices = db.query(Invoice).filter_by(id=invoice_id).all()
+        else:
+            if force:
+                invoices = db.query(Invoice).all()
+            else:
+                extracted_ids = db.query(InvoiceLineItem.invoice_id).distinct()
+                invoices = db.query(Invoice).filter(
+                    ~Invoice.id.in_(extracted_ids)
+                ).all()
+
+        logger.info(f'Processing {len(invoices)} invoices for product extraction')
+
+        for i, invoice in enumerate(invoices):
+            sync_status['progress'] = f'Extracting products from invoice {i+1}/{len(invoices)}...'
+
+            if force:
+                db.query(InvoiceLineItem).filter_by(invoice_id=invoice.id).delete()
+                db.flush()
+
+            try:
+                pdf_bytes = client.get_invoice_pdf(invoice.fortnox_id)
+                update_stored_tokens(client)
+            except Exception as e:
+                logger.warning(f'Could not get PDF for invoice {invoice.fortnox_id}: {e}')
+                continue
+
+            if not pdf_bytes:
+                continue
+
+            # Extract products using Claude
+            products = extract_products_from_pdf(
+                pdf_bytes,
+                supplier_name=invoice.supplier_name or '',
+                invoice_number=invoice.invoice_number or ''
+            )
+
+            for prod_data in products:
+                article_number = str(prod_data.get('article_number', '')).strip()
+                description = str(prod_data.get('description', '')).strip()
+                quantity = prod_data.get('quantity', 0)
+                unit = str(prod_data.get('unit', '')).strip()
+                unit_price = prod_data.get('unit_price', 0)
+                total = prod_data.get('total', 0)
+                pkg_weight = prod_data.get('package_weight_grams')
+
+                if not description and not article_number:
+                    continue
+
+                # Try to convert numeric values
+                try:
+                    quantity = float(quantity) if quantity else 0
+                except (ValueError, TypeError):
+                    quantity = 0
+                try:
+                    unit_price = float(unit_price) if unit_price else 0
+                except (ValueError, TypeError):
+                    unit_price = 0
+                try:
+                    total = float(total) if total else 0
+                except (ValueError, TypeError):
+                    total = 0
+                try:
+                    pkg_weight = float(pkg_weight) if pkg_weight else None
+                except (ValueError, TypeError):
+                    pkg_weight = None
+
+                # Find or create product
+                product = None
+                if article_number:
+                    product = db.query(Product).filter_by(
+                        fortnox_article_number=article_number
+                    ).first()
+
+                if not product and description:
+                    product = db.query(Product).filter(
+                        Product.name.ilike(f'%{description[:30]}%')
+                    ).first()
+
+                if not product:
+                    product = Product(
+                        fortnox_article_number=article_number or None,
+                        name=description or article_number,
+                        supplier_id=invoice.supplier_id,
+                        unit=unit or None,
+                        current_price=unit_price if unit_price > 0 else None,
+                        package_weight_grams=pkg_weight
+                    )
+                    db.add(product)
+                    db.flush()
+
+                # Create line item
+                line_item = InvoiceLineItem(
+                    invoice_id=invoice.id,
+                    product_id=product.id if product else None,
+                    article_number=article_number,
+                    description=description,
+                    quantity=quantity,
+                    unit=unit,
+                    unit_price=unit_price,
+                    total=total,
+                    package_weight_grams=pkg_weight
+                )
+                db.add(line_item)
+
+                # Create price history entry
+                if product and unit_price > 0:
+                    price_entry = PriceHistory(
+                        product_id=product.id,
+                        price=unit_price,
+                        date=invoice.invoice_date or datetime.utcnow(),
+                        invoice_number=invoice.invoice_number or '',
+                        invoice_id=invoice.id
+                    )
+                    db.add(price_entry)
+                    product.current_price = unit_price
+                    if pkg_weight:
+                        product.package_weight_grams = pkg_weight
+
+                total_products += 1
+
+            db.commit()
+
+        logger.info(f'Extracted {total_products} total products from invoices')
+    except Exception as e:
+        db.rollback()
+        logger.error(f'Error extracting products: {e}')
+        raise
+    finally:
+        db.close()
+
+    return total_products
+
+
+def re_extract_all_invoices():
+    """
+    Re-extract ALL invoices with force=True.
+    This clears existing line items and re-processes every invoice PDF.
+    Used to backfill package_weight_grams for products that were extracted
+    before that field existed.
+    """
+    logger.info('Starting full re-extraction of all invoices...')
+    return extract_invoice_products(force=True)
+
+
+def sync_all():
+    """Run full sync: suppliers -> invoices -> product extraction."""
+    if sync_status['is_syncing']:
+        logger.warning('Sync already in progress')
+        return sync_status
+
+    sync_status['is_syncing'] = True
+    sync_status['last_error'] = None
+    sync_status['progress'] = 'Starting sync...'
+
+    log = SyncLog(sync_type='full', status='running')
+    db = Session()
+    db.add(log)
+    db.commit()
+    log_id = log.id
+    db.close()
+
+    try:
+        supplier_count = sync_suppliers()
+        sync_status['suppliers_synced'] = supplier_count
+
+        invoice_count = sync_invoices()
+        sync_status['invoices_synced'] = invoice_count
+
+        product_count = extract_invoice_products()
+        sync_status['products_extracted'] = product_count
+
+        sync_status['last_sync'] = datetime.utcnow().isoformat()
+        sync_status['progress'] = 'Sync complete!'
+
+        db = Session()
+        log = db.query(SyncLog).filter_by(id=log_id).first()
+        if log:
+            log.status = 'completed'
+            log.records_synced = supplier_count + invoice_count + product_count
+            log.completed_at = datetime.utcnow()
+            db.commit()
+        db.close()
+
+        logger.info(f'Full sync complete: {supplier_count} suppliers, {invoice_count} invoices, {product_count} products')
+
+    except Exception as e:
+        sync_status['last_error'] = str(e)
+        sync_status['progress'] = f'Sync failed: {e}'
+        logger.error(f'Sync failed: {e}')
+
+        db = Session()
+        log = db.query(SyncLog).filter_by(id=log_id).first()
+        if log:
+            log.status = 'failed'
+            log.error_message = str(e)
+            log.completed_at = datetime.utcnow()
+            db.commit()
+        db.close()
+
+    finally:
+        sync_status['is_syncing'] = False
+
+    return sync_status
+
+
+def start_auto_sync():
+    """Start auto-sync in a background thread (called on app startup)."""
+    def _auto_sync():
+        try:
+            import time
+            time.sleep(5)
+
+            db = Session()
+            token = db.query(FortnoxToken).first()
+            db.close()
+
+            if not token:
+                logger.info('No Fortnox token found — skipping auto-sync')
+                return
+
+            db = Session()
+            last_log = db.query(SyncLog).filter_by(
+                status='completed'
+            ).order_by(SyncLog.completed_at.desc()).first()
+            db.close()
+
+            if last_log and last_log.completed_at:
+                hours_since = (datetime.utcnow() - last_log.completed_at).total_seconds() / 3600
+                if hours_since < 6:
+                    logger.info(f'Last sync was {hours_since:.1f} hours ago — skipping auto-sync')
+                    return
+
+            logger.info('Starting auto-sync...')
+            sync_all()
+
+        except Exception as e:
+            logger.error(f'Auto-sync error: {e}')
+
+    thread = threading.Thread(target=_auto_sync, daemon=True)
+    thread.start()
+    return thread
+"""
 Sync service — pulls data from Fortnox and saves it to PostgreSQL.
 Handles suppliers, articles, and supplier invoices.
 For invoices: downloads attached PDFs and uses Claude API to extract product line items.
