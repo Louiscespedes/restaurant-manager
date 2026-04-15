@@ -30,38 +30,14 @@ sync_status = {
 
 
 def get_fortnox_client():
-    """Get a FortnoxClient with stored tokens."""
-    db = Session()
-    try:
-        token = db.query(FortnoxToken).order_by(FortnoxToken.id.desc()).first()
-        if not token:
-            logger.warning('No Fortnox token found — cannot sync')
-            return None
-        client = FortnoxClient(
-            access_token=token.access_token,
-            refresh_token=token.refresh_token
-        )
-        return client
-    finally:
-        db.close()
+    """Get a FortnoxClient with stored tokens (uses session_factory pattern)."""
+    client = FortnoxClient(session_factory=Session)
+    if not client.access_token:
+        logger.warning('No Fortnox token found — cannot sync')
+        return None
+    return client
 
 
-def update_stored_tokens(client):
-    """Save refreshed tokens back to database."""
-    db = Session()
-    try:
-        token = db.query(FortnoxToken).order_by(FortnoxToken.id.desc()).first()
-        if token and client.access_token:
-            token.access_token = client.access_token
-            token.refresh_token = client.refresh_token
-            token.updated_at = datetime.utcnow()
-            db.commit()
-            logger.info('Updated stored Fortnox tokens')
-    except Exception as e:
-        db.rollback()
-        logger.error(f'Error updating tokens: {e}')
-    finally:
-        db.close()
 
 
 def sync_suppliers():
@@ -75,7 +51,6 @@ def sync_suppliers():
     count = 0
     try:
         suppliers_data = client.get_suppliers()
-        update_stored_tokens(client)
 
         for s in suppliers_data:
             fortnox_id = str(s.get('SupplierNumber', ''))
@@ -128,7 +103,6 @@ def sync_invoices():
     count = 0
     try:
         invoices_data = client.get_supplier_invoices()
-        update_stored_tokens(client)
 
         for inv in invoices_data:
             fortnox_id = str(inv.get('GivenNumber', inv.get('InvoiceNumber', '')))
@@ -222,8 +196,7 @@ def extract_invoice_products(invoice_id=None, force=False):
 
             try:
                 pdf_bytes = client.get_invoice_pdf(invoice.fortnox_id)
-                update_stored_tokens(client)
-            except Exception as e:
+                    except Exception as e:
                 logger.warning(f'Could not get PDF for invoice {invoice.fortnox_id}: {e}')
                 continue
 
