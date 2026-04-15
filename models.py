@@ -40,9 +40,10 @@ class Product(Base):
     fortnox_article_number = Column(String, unique=True, nullable=True)
     name = Column(String, nullable=False)
     supplier_id = Column(Integer, ForeignKey('suppliers.id'), nullable=True)
-    unit = Column(String, nullable=True)
+    unit = Column(String, nullable=True)  # kg, st, liter, etc.
     current_price = Column(Float, nullable=True)
     category = Column(String, nullable=True)
+    package_weight_grams = Column(Float, nullable=True)  # Weight per package for unit normalization
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -74,6 +75,7 @@ class Invoice(Base):
 
 
 class InvoiceLineItem(Base):
+    """Individual line items from each invoice — this is where price tracking happens."""
     __tablename__ = 'invoice_line_items'
 
     id = Column(Integer, primary_key=True)
@@ -86,12 +88,14 @@ class InvoiceLineItem(Base):
     unit_price = Column(Float, nullable=True)
     total = Column(Float, nullable=True)
     vat_percent = Column(Float, nullable=True)
+    package_weight_grams = Column(Float, nullable=True)  # Weight per package in grams
 
     invoice = relationship('Invoice', back_populates='line_items')
     product = relationship('Product')
 
 
 class PriceHistory(Base):
+    """Tracks price changes per product over time — built from invoice line items."""
     __tablename__ = 'price_history'
 
     id = Column(Integer, primary_key=True)
@@ -105,6 +109,7 @@ class PriceHistory(Base):
 
 
 class FortnoxToken(Base):
+    """Stores OAuth tokens so they persist across restarts."""
     __tablename__ = 'fortnox_tokens'
 
     id = Column(Integer, primary_key=True)
@@ -116,6 +121,7 @@ class FortnoxToken(Base):
 
 
 class SyncLog(Base):
+    """Tracks sync history so we know what has been imported."""
     __tablename__ = 'sync_logs'
 
     id = Column(Integer, primary_key=True)
