@@ -34,6 +34,27 @@ def run_migrations():
     from sqlalchemy import text
     db = Session()
     try:
+        # Drop recipe-related tables so create_all() rebuilds them with correct schema
+        drop_tables = [
+            "DROP TABLE IF EXISTS menu_items CASCADE",
+            "DROP TABLE IF EXISTS menus CASCADE",
+            "DROP TABLE IF EXISTS dish_components CASCADE",
+            "DROP TABLE IF EXISTS dishes CASCADE",
+            "DROP TABLE IF EXISTS recipe_ingredients CASCADE",
+            "DROP TABLE IF EXISTS recipes CASCADE",
+        ]
+        for sql in drop_tables:
+            try:
+                db.execute(text(sql))
+            except Exception as e:
+                logger.warning(f"Drop table skipped: {e}")
+        db.commit()
+        logger.info("Dropped recipe tables for schema rebuild")
+
+        # Re-create all tables with correct schema
+        Base.metadata.create_all(engine)
+        logger.info("Tables recreated with correct schema")
+
         migrations = [
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR",
