@@ -196,7 +196,7 @@ def extract_invoice_products(invoice_id=None, force=False):
 
             try:
                 pdf_bytes = client.get_invoice_pdf(invoice.fortnox_id)
-                    except Exception as e:
+            except Exception as e:
                 logger.warning(f'Could not get PDF for invoice {invoice.fortnox_id}: {e}')
                 continue
 
