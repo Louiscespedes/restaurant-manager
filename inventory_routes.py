@@ -295,14 +295,12 @@ def _apply_answer(session, question_id, answer):
         item["needs_clarification"] = False
         return True, "Skipped"
 
-    if q_type == "product_match":
-        item["description"] = answer
-        item["matched_product_name"] = answer
-        item["needs_clarification"] = False
-
-    elif q_type == "cut_variant":
-        item["description"] = answer
-        item["matched_product_name"] = answer
+    if q_type in ("product_match", "cut_variant"):
+        # Clean answer: strip price/supplier info that may be in the option text
+        # e.g. "Tomat grön - 100.29 SEK/kg (MENIGO FOODSERVICE AB)" -> "Tomat grön"
+        clean_name = answer.split(" - ")[0].split(" (")[0].strip()
+        item["description"] = clean_name
+        item["matched_product_name"] = clean_name
         item["needs_clarification"] = False
 
     elif q_type == "supplier_choice":
@@ -848,6 +846,22 @@ def confirm_review_session(session_id):
             inv = Inventory(year=year, month=month, status="draft")
             db.add(inv)
             db.flush()
+
+        # Re-enrich items: look up products for any items that got matched during review
+        for item_data in session_data["items"]:
+            matched = item_data.get("matched_product_name")
+            if matched and not item_data.get("unit_price"):
+                product = db.query(Product).filter(
+                    Product.name.ilike(f"%{matched[:30]}%")
+                ).first()
+                if product:
+                    item_data["product_id"] = product.id
+                    if product.current_price:
+                        item_data["unit_price"] = product.current_price
+                    if product.supplier:
+                        item_data["supplier_name"] = product.supplier.name
+                    # Normalize units before calculating
+                    _normalize_item_unit(item_data)
 
         total = 0
         for item_data in session_data["items"]:
