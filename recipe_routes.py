@@ -316,7 +316,8 @@ Return a JSON object with this structure:
       "clarification_question": "question to ask the user if needs_clarification is true, e.g. 'Which supplier for carrots: Sorunda or Menigo?'",
       "suggested_trimming_percent": number or 0
     }}
-  ]
+  ],
+  "notes": "all cooking instructions, method steps, and preparation notes from the text (lines starting with - or describing how to cook/prepare — everything that is NOT an ingredient line)"
 }}
 
 Be smart about matching:
@@ -325,6 +326,8 @@ Be smart about matching:
 - If a product seems like a finished item (ice cream, bread), note it may need a recipe
 - Suggest trimming percentages for common items (20% for fish, 15% for meat, 10% for vegetables, etc.)
 - Normalize all units consistently (convert tbsp to ml, cups to dl, etc.)
+
+- IMPORTANT: Extract ALL cooking instructions, method steps, and preparation notes into the "notes" field. Lines starting with "-" or describing cooking methods/techniques are NOT ingredients — they go into notes. Include the full process/method.
 
 Return ONLY valid JSON, no markdown formatting."""
 
