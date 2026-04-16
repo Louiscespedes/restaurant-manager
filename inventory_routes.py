@@ -102,7 +102,23 @@ def parse_single_batch(batch_text, products_context, recipe_context, batch_num, 
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-    prompt = f"""You are an inventory parser for a high-end restaurant.
+    prompt = f"""You are an expert inventory parser for a high-end restaurant.
+You are also a culinary expert who knows global cuisine terminology:
+- Japanese: otoro/ottoro = fatty bluefin tuna belly, chutoro = medium fatty tuna, akami = lean tuna,
+  hamachi = yellowtail, uni = sea urchin, ikura = salmon roe, wagyu = Japanese beef,
+  dashi = stock, miso, yuzu, shiso, nori, ponzu, mirin, sake, edamame, tobiko
+- French: ris de veau = sweetbread (thymus gland), foie gras/foise gras = duck/goose liver,
+  lardo = cured pork back fat, confit = slow-cooked in fat, bouillon = broth,
+  roux, beurre blanc, veloute, jus, bisque, consomme, creme fraiche
+- Swedish/Nordic: gravlax, rodbetor = beetroot, kantareller = chanterelles,
+  hjort = venison, renkott = reindeer, kraftor = crayfish, lingon = lingonberry
+- General fine dining: sweetbread, bone marrow, truffle, Iberico, bottarga, nduja, burrata,
+  ceviche, tartare, carpaccio, bresaola, pancetta, guanciale
+
+Use this knowledge to INFER what the user means even with misspellings or shorthand.
+Example: "Ottoro 680g" -> you KNOW this is otoro (fatty bluefin tuna belly) -> search for tuna/bluefin in known products.
+Example: "Foise gras 400g" -> foie gras (duck liver) -> search for foie/liver in known products.
+
 Parse messy inventory text into structured data.
 The text may be in French, English, or Swedish (or mixed).
 The user likely wrote this quickly on their phone.
@@ -132,7 +148,7 @@ Return JSON:
       "is_finished_product": true/false,
       "matched_recipe_name": "recipe name if this is a finished product, or null",
       "needs_clarification": true/false,
-      "clarification_type": "product_match, cut_variant, trimming_loss, recipe_cost, supplier_choice, unit_mismatch, or null",
+      "clarification_type": "product_match, cut_variant, trimming_loss, recipe_cost, supplier_choice, unit_mismatch, unknown_product, or null",
       "clarification_question": "question for user, or null",
       "clarification_options": ["option1", "option2", "option3"] or null
     }}
@@ -155,6 +171,10 @@ Rules:
 - Prices from suppliers are ALWAYS per kg (weight) or per liter (volume) or per piece (st) -- never per gram or ml
 - When setting unit_price, use the per-kg or per-liter price -- the server normalizes quantities automatically
 - ALWAYS output the "description" field in ENGLISH (translate Swedish/other languages to English). Example: "Tomat grön" -> "Green tomato", "Morötter" -> "Carrots", "Lax" -> "Salmon". Keep matched_product_name in the ORIGINAL language (Swedish) for database matching.
+- If you genuinely CANNOT determine what a product is even with culinary knowledge, flag with type "unknown_product". Question: "I don't recognize '[item name]'. What product is this?" Options: ["Type the product name"]. This is a LAST RESORT -- use your food knowledge first.
+- When a generic term like "corn" is used, ask with type "product_match": "You wrote 'corn 2kg'. What did you mean?" with options like ["Sweet corn on cob", "Corn flour", "Canned corn", "Cornstarch", "Other - type below"]
+- ALWAYS include the quantity and unit from the original text in your parsed output -- never drop the amount
+- When you infer what a product is (e.g. "ottoro" -> bluefin tuna), use your inference to search the KNOWN PRODUCTS list. If you find a match, set matched_product_name to that known product.
 - Return ONLY valid JSON, no markdown"""
 
     logger.info(f"Processing batch {batch_num}/{total_batches} ...")
