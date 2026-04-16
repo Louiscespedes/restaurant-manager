@@ -120,7 +120,7 @@ Return JSON:
 {{
   "items": [
     {{
-      "description": "clean product name",
+      "description": "product name in ENGLISH (translate Swedish names to English)",
       "quantity": number,
       "unit": "kg, g, liter, st, etc.",
       "category": "fish, meat, vegetables, dairy, wine, spirits, cleaning, prepared, dry_goods, other",
@@ -153,6 +153,7 @@ Rules:
 - If the user wrote a generic term like "oil", "flour", "fish", "mushroom" etc, flag for clarification
 - Prices from suppliers are ALWAYS per kg (weight) or per liter (volume) or per piece (st) -- never per gram or ml
 - When setting unit_price, use the per-kg or per-liter price -- the server normalizes quantities automatically
+- ALWAYS output the "description" field in ENGLISH (translate Swedish/other languages to English). Example: "Tomat grön" -> "Green tomato", "Morötter" -> "Carrots", "Lax" -> "Salmon". Keep matched_product_name in the ORIGINAL language (Swedish) for database matching.
 - Return ONLY valid JSON, no markdown"""
 
     logger.info(f"Processing batch {batch_num}/{total_batches} ...")
@@ -299,8 +300,10 @@ def _apply_answer(session, question_id, answer):
         # Clean answer: strip price/supplier info that may be in the option text
         # e.g. "Tomat grön - 100.29 SEK/kg (MENIGO FOODSERVICE AB)" -> "Tomat grön"
         clean_name = answer.split(" - ")[0].split(" (")[0].strip()
-        item["description"] = clean_name
+        # Set matched_product_name for DB lookup; keep AI's English description if available
         item["matched_product_name"] = clean_name
+        if not item.get("description") or item["description"].lower() == clean_name.lower():
+            item["description"] = clean_name  # No AI description, use product name
         item["needs_clarification"] = False
 
     elif q_type == "supplier_choice":
@@ -619,17 +622,25 @@ def parse_inventory_text():
         for item in all_items:
             _normalize_item_unit(item)
 
-        # Enrich with product IDs and prices
+        # Enrich with product IDs and prices (skip items needing clarification — they get re-enriched at confirm)
         for item in all_items:
-            matched_name = item.get("matched_product_name")
+            if item.get("needs_clarification"):
+                continue  # Don't set prices for ambiguous items — wait for user to pick
+            matched_name = item.get("matched_product_name") or item.get("description")
             if matched_name:
+                # Try exact match first, then partial
                 product = db.query(Product).filter(
-                    Product.name.ilike(f"%{matched_name[:30]}%")
+                    func.lower(Product.name) == matched_name.lower().strip()
                 ).first()
+                if not product:
+                    product = db.query(Product).filter(
+                        Product.name.ilike(f"%{matched_name[:30]}%")
+                    ).first()
                 if product:
                     item["product_id"] = product.id
-                    if not item.get("unit_price") and product.current_price:
+                    if product.current_price:
                         item["unit_price"] = product.current_price
+                        item["price_found"] = True
                     if not item.get("supplier_name") and product.supplier:
                         item["supplier_name"] = product.supplier.name
 
@@ -847,21 +858,30 @@ def confirm_review_session(session_id):
             db.add(inv)
             db.flush()
 
-        # Re-enrich items: look up products for any items that got matched during review
+        # Re-enrich ALL items: aggressively look up products and prices
         for item_data in session_data["items"]:
-            matched = item_data.get("matched_product_name")
-            if matched and not item_data.get("unit_price"):
+            _normalize_item_unit(item_data)
+            # Try matched_product_name first, then fall back to description
+            search_name = item_data.get("matched_product_name") or item_data.get("description")
+            if not search_name:
+                continue
+            # Try exact match first
+            product = db.query(Product).filter(
+                func.lower(Product.name) == search_name.lower().strip()
+            ).first()
+            # Fall back to ilike partial match
+            if not product:
                 product = db.query(Product).filter(
-                    Product.name.ilike(f"%{matched[:30]}%")
+                    Product.name.ilike(f"%{search_name[:30]}%")
                 ).first()
-                if product:
-                    item_data["product_id"] = product.id
-                    if product.current_price:
-                        item_data["unit_price"] = product.current_price
-                    if product.supplier:
-                        item_data["supplier_name"] = product.supplier.name
-                    # Normalize units before calculating
-                    _normalize_item_unit(item_data)
+            if product:
+                item_data["product_id"] = product.id
+                # Always set the price from the database (override AI-guessed prices)
+                if product.current_price:
+                    item_data["unit_price"] = product.current_price
+                    item_data["price_found"] = True
+                if product.supplier and not item_data.get("supplier_name"):
+                    item_data["supplier_name"] = product.supplier.name
 
         total = 0
         for item_data in session_data["items"]:
