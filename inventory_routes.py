@@ -696,9 +696,21 @@ def parse_inventory_text():
             product_list.append(entry)
         products_context = "\n".join(product_list[:250])
 
-        # Get known recipes for finished products
+        # Get known recipes for finished products (with cost info)
+        from recipe_routes import calc_recipe_cost
         recipes = db.query(Recipe).all()
-        recipe_list = [f"- {r.name} (category: {r.category})" for r in recipes]
+        recipe_list = []
+        for r in recipes:
+            cost_info = calc_recipe_cost(r) if r.ingredients else {"per_portion": 0, "total_cost": 0}
+            parts = [f"- {r.name} (category: {r.category or 'other'}"]
+            if r.portions:
+                parts.append(f", {r.portions} portions")
+            if cost_info["per_portion"] > 0:
+                parts.append(f", cost/portion: {cost_info['per_portion']} SEK")
+            if cost_info["total_cost"] > 0:
+                parts.append(f", total: {cost_info['total_cost']} SEK")
+            parts.append(")")
+            recipe_list.append("".join(parts))
         recipe_context = "\n".join(recipe_list[:50])
 
         # Split into batches
@@ -779,6 +791,15 @@ def parse_inventory_text():
                 ).first()
                 if recipe:
                     item["recipe_id"] = recipe.id
+                    item["is_finished_product"] = True
+                    # Calculate price from recipe cost
+                    if recipe.ingredients and not item.get("unit_price"):
+                        cost_info = calc_recipe_cost(recipe)
+                        if cost_info["per_portion"] > 0:
+                            item["unit_price"] = cost_info["per_portion"]
+                            item["price_found"] = True
+                            item["is_recipe_price"] = True
+                            item["recipe_name"] = recipe.name
 
         # Create a review session
         session_id = _create_review_session(all_items, year=year, month=month)
