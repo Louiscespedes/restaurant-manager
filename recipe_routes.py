@@ -754,3 +754,131 @@ def dish_categories():
         return jsonify([c[0] for c in cats])
     finally:
         db.close()
+
+
+# ─── Smart Search (cross-language) ─────────────────────────────────
+
+@recipe_bp.route("/api/search/products", methods=["GET"])
+def search_products_smart():
+    """Search products with cross-language support (EN/SV/FR).
+    First tries direct DB match, then uses AI translation if no results.
+    Query param: ?q=lobster
+    """
+    query = request.args.get("q", "").strip()
+    if not query or len(query) < 2:
+        return jsonify([])
+
+    db = Session()
+    try:
+        # Step 1: Direct ILIKE search
+        search_term = f"%{query}%"
+        products = db.query(Product).filter(
+            Product.name.ilike(search_term)
+        ).order_by(Product.name).limit(20).all()
+
+        # Step 2: If no direct match, use AI to translate and search
+        if not products:
+            try:
+                client = anthropic.Anthropic()
+                translate_response = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=200,
+                    messages=[{"role": "user", "content": f"""Translate this food/ingredient term into Swedish, French, and English.
+Return ONLY a JSON array of search terms (strings), including the original.
+Example: ["lobster", "hummer", "homard"]
+Term: {query}"""}]
+                )
+                import json as json_mod
+                terms_text = translate_response.content[0].text.strip()
+                if terms_text.startswith("["):
+                    search_terms = json_mod.loads(terms_text)
+                else:
+                    search_terms = [query]
+
+                # Search with all translated terms
+                from sqlalchemy import or_
+                conditions = [Product.name.ilike(f"%{term}%") for term in search_terms]
+                products = db.query(Product).filter(
+                    or_(*conditions)
+                ).order_by(Product.name).limit(20).all()
+            except Exception as e:
+                logger.error(f"AI translation search failed: {e}")
+                products = []
+
+        results = []
+        for p in products:
+            results.append({
+                "id": p.id,
+                "name": p.name,
+                "supplier_id": p.supplier_id,
+                "supplier_name": p.supplier.name if p.supplier else None,
+                "unit": p.unit,
+                "latest_price": p.latest_price,
+                "current_price": p.current_price,
+                "category": p.category
+            })
+        return jsonify(results)
+    finally:
+        db.close()
+
+
+@recipe_bp.route("/api/search/recipes", methods=["GET"])
+def search_recipes_smart():
+    """Search recipes by name with cross-language support.
+    Query param: ?q=ice cream
+    """
+    query = request.args.get("q", "").strip()
+    if not query or len(query) < 2:
+        return jsonify([])
+
+    db = Session()
+    try:
+        # Direct ILIKE search
+        search_term = f"%{query}%"
+        recipes = db.query(Recipe).filter(
+            Recipe.name.ilike(search_term)
+        ).order_by(Recipe.name).limit(20).all()
+
+        # If no match, try AI translation
+        if not recipes:
+            try:
+                client = anthropic.Anthropic()
+                translate_response = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=200,
+                    messages=[{"role": "user", "content": f"""Translate this food/dish/recipe term into Swedish, French, and English.
+Return ONLY a JSON array of search terms (strings), including the original.
+Example: ["ice cream", "glass", "glace"]
+Term: {query}"""}]
+                )
+                import json as json_mod
+                terms_text = translate_response.content[0].text.strip()
+                if terms_text.startswith("["):
+                    search_terms = json_mod.loads(terms_text)
+                else:
+                    search_terms = [query]
+
+                from sqlalchemy import or_
+                conditions = [Recipe.name.ilike(f"%{term}%") for term in search_terms]
+                recipes = db.query(Recipe).filter(
+                    or_(*conditions)
+                ).order_by(Recipe.name).limit(20).all()
+            except Exception as e:
+                logger.error(f"AI recipe search failed: {e}")
+                recipes = []
+
+        results = []
+        for r in recipes:
+            cost_info = calc_recipe_cost(r) if r.ingredients else {"per_portion": 0, "total_cost": 0}
+            results.append({
+                "id": r.id,
+                "name": r.name,
+                "category": r.category,
+                "portions": r.portions,
+                "cost_per_portion": cost_info["per_portion"],
+                "total_cost": cost_info["total_cost"],
+                "ingredient_count": len(r.ingredients) if r.ingredients else 0
+            })
+        return jsonify(results)
+    finally:
+        db.close()
