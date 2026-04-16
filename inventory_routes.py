@@ -501,7 +501,7 @@ def update_inventory(inv_id):
                 qty = item_data.get("quantity") or 0
                 price = item_data.get("unit_price") or 0
                 trim = float(item_data.get("trimming_pct") or 0)
-            line_total = round(qty * price / (1 - trim / 100), 2) if 0 < trim < 100 else round(qty * price, 2)
+                line_total = round(qty * price / (1 - trim / 100), 2) if 0 < trim < 100 else round(qty * price, 2)
                 item = InventoryItem(
                     inventory_id=inv.id,
                     product_id=item_data.get("product_id"),
@@ -511,7 +511,7 @@ def update_inventory(inv_id):
                     unit=item_data.get("unit"),
                     unit_price=price,
                     is_manual_price=item_data.get("is_manual_price", False),
-                trimming_pct=float(item_data.get("trimming_pct") or 0),
+                    trimming_pct=float(item_data.get("trimming_pct") or 0),
                     category=item_data.get("category"),
                     supplier_name=item_data.get("supplier_name"),
                     total_value=line_total
