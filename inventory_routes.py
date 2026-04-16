@@ -243,11 +243,19 @@ def _create_review_session(items, year=None, month=None):
             if "Skip" not in options and "skip" not in [o.lower() for o in options]:
                 options.append("Skip")
 
+            # Include item name in question for context
+            item_name = item.get("description") or item.get("matched_product_name") or "Unknown item"
+            question_text = item["clarification_question"]
+            # Prefix with item name if not already mentioned
+            if item_name.lower() not in question_text.lower():
+                question_text = f"[{item_name}] {question_text}"
+
             questions.append({
                 "id": len(questions) + 1,
                 "item_index": idx,
                 "type": q_type,
-                "question": item["clarification_question"],
+                "item_description": item_name,
+                "question": question_text,
                 "options": options,
                 "answer": None,
                 "is_answered": False
