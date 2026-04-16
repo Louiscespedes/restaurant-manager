@@ -76,6 +76,7 @@ def item_to_dict(item):
         "category": item.category,
         "supplier_name": item.supplier_name,
         "total_value": round(item.total_value or 0, 2),
+            "trimming_pct": item.trimming_pct or 0,
         "price_found": item.unit_price is not None and item.unit_price > 0
     }
 
@@ -324,6 +325,7 @@ def _apply_answer(session, question_id, answer):
             pct = float(pct_str)
             if item.get("unit_price") and pct > 0 and pct < 100:
                 item["trimming_loss_pct"] = pct
+                item["trimming_pct"] = pct
                 item["original_price"] = item["unit_price"]
                 item["unit_price"] = round(item["unit_price"] / (1 - pct / 100), 2)
         except (ValueError, TypeError):
@@ -444,7 +446,8 @@ def create_inventory():
         for item_data in data.get("items", []):
             qty = item_data.get("quantity") or 0
             price = item_data.get("unit_price") or 0
-            line_total = qty * price
+            trim = float(item_data.get("trimming_pct") or 0)
+            line_total = round(qty * price / (1 - trim / 100), 2) if 0 < trim < 100 else round(qty * price, 2)
             item = InventoryItem(
                 inventory_id=inv.id,
                 product_id=item_data.get("product_id"),
@@ -454,6 +457,7 @@ def create_inventory():
                 unit=item_data.get("unit"),
                 unit_price=price,
                 is_manual_price=item_data.get("is_manual_price", False),
+                trimming_pct=float(item_data.get("trimming_pct") or 0),
                 category=item_data.get("category"),
                 supplier_name=item_data.get("supplier_name"),
                 total_value=line_total
@@ -496,7 +500,8 @@ def update_inventory(inv_id):
             for item_data in data["items"]:
                 qty = item_data.get("quantity") or 0
                 price = item_data.get("unit_price") or 0
-                line_total = qty * price
+                trim = float(item_data.get("trimming_pct") or 0)
+            line_total = round(qty * price / (1 - trim / 100), 2) if 0 < trim < 100 else round(qty * price, 2)
                 item = InventoryItem(
                     inventory_id=inv.id,
                     product_id=item_data.get("product_id"),
@@ -506,6 +511,7 @@ def update_inventory(inv_id):
                     unit=item_data.get("unit"),
                     unit_price=price,
                     is_manual_price=item_data.get("is_manual_price", False),
+                trimming_pct=float(item_data.get("trimming_pct") or 0),
                     category=item_data.get("category"),
                     supplier_name=item_data.get("supplier_name"),
                     total_value=line_total
@@ -895,7 +901,8 @@ def confirm_review_session(session_id):
         for item_data in session_data["items"]:
             qty = item_data.get("quantity") or 0
             price = item_data.get("unit_price") or 0
-            line_total = qty * price
+            trim = float(item_data.get("trimming_pct") or 0)
+            line_total = round(qty * price / (1 - trim / 100), 2) if 0 < trim < 100 else round(qty * price, 2)
             item = InventoryItem(
                 inventory_id=inv.id,
                 product_id=item_data.get("product_id"),
@@ -905,6 +912,7 @@ def confirm_review_session(session_id):
                 unit=item_data.get("unit"),
                 unit_price=price,
                 is_manual_price=item_data.get("is_manual_price", False),
+                trimming_pct=float(item_data.get("trimming_pct") or 0),
                 category=item_data.get("category"),
                 supplier_name=item_data.get("supplier_name"),
                 total_value=line_total
