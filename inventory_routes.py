@@ -1,14 +1,19 @@
 """
-Inventory API routes â input, AI processing, storage, and comparison.
+Inventory API routes — input, AI processing, review sessions, storage, and comparison.
 Register with: app.register_blueprint(inventory_bp)
 
-BATCH PROCESSING: The parse endpoint now splits large inventories into
+BATCH PROCESSING: The parse endpoint splits large inventories into
 batches of ~30 items and processes them in parallel for speed.
+
+REVIEW SESSIONS: After parsing, items needing clarification go through
+an in-memory review flow (one question at a time) before final save.
 """
 import logging
 import json
 import os
-import math
+import uuid
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Blueprint, request, jsonify
 from datetime import datetime
@@ -21,7 +26,7 @@ from models import (
 logger = logging.getLogger(__name__)
 inventory_bp = Blueprint('inventory', __name__)
 
-# âââ Helpers âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# --- Helpers -----------------------------------------------------------------
 
 MONTH_NAMES_SV = {
     1: "Januari", 2: "Februari", 3: "Mars", 4: "April",
@@ -74,22 +79,20 @@ def item_to_dict(item):
         "price_found": item.unit_price is not None and item.unit_price > 0
     }
 
-# âââ Batch parsing helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# --- Batch parsing helpers ---------------------------------------------------
 
-BATCH_SIZE = 30  # items per Claude API call
-MAX_PARALLEL = 5  # max concurrent Claude calls
+BATCH_SIZE = 30
+MAX_PARALLEL = 5
 
 def split_text_into_batches(raw_text, batch_size=BATCH_SIZE):
     """Split inventory text into batches of ~batch_size lines."""
     lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
     if not lines:
         return [raw_text]
-
     batches = []
     for i in range(0, len(lines), batch_size):
         batch = '\n'.join(lines[i:i + batch_size])
         batches.append(batch)
-
     logger.info(f"Split {len(lines)} lines into {len(batches)} batches of ~{batch_size}")
     return batches
 
@@ -128,16 +131,21 @@ Return JSON:
       "is_finished_product": true/false,
       "matched_recipe_name": "recipe name if this is a finished product, or null",
       "needs_clarification": true/false,
-      "clarification_question": "question for user, or null"
+      "clarification_type": "product_match, cut_variant, trimming_loss, recipe_cost, supplier_choice, unit_mismatch, or null",
+      "clarification_question": "question for user, or null",
+      "clarification_options": ["option1", "option2", "option3"] or null
     }}
   ]
 }}
 
 Rules:
-- Match products across languages: morÃ¶tter = carrots = carottes
-- If unit is per-piece but price is per-kg, flag for clarification
-- If multiple suppliers sell same product, ask which one
-- If item looks like a finished product (ice cream, bread, sauce), set is_finished_product=true and check recipes
+- Match products across languages: morottor = carrots = carottes
+- If unit is per-piece but price is per-kg, flag for clarification with type "unit_mismatch"
+- If multiple suppliers sell same product, flag with type "supplier_choice" and list supplier names as options
+- If a product name matches multiple items in the database, flag with type "product_match" and list the options
+- If meat/fish terms are ambiguous (e.g. "beef" could be multiple cuts), flag with type "cut_variant"
+- If user writes "trimmed" or indicates waste, flag with type "trimming_loss" and options ["10%", "15%", "20%", "25%", "Custom"]
+- If item looks like a finished product (ice cream, bread, sauce), set is_finished_product=true, check recipes, flag with type "recipe_cost"
 - Categorize everything: fish, meat, vegetables, dairy, wine, spirits, cleaning, prepared, dry_goods, other
 - Normalize units (always use kg for weight >500g, g for <500g, liter for liquids, st for pieces)
 - Return ONLY valid JSON, no markdown"""
@@ -163,7 +171,144 @@ Rules:
     return items
 
 
-# âââ Inventory CRUD ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# --- Review Session Storage (in-memory) --------------------------------------
+# Sessions are transient -- they live between parse and confirm.
+# Cleaned up after 2 hours automatically.
+
+_review_sessions = {}
+_sessions_lock = threading.Lock()
+SESSION_TTL = 7200  # 2 hours
+
+def _cleanup_old_sessions():
+    """Remove sessions older than TTL."""
+    now = time.time()
+    with _sessions_lock:
+        expired = [sid for sid, s in _review_sessions.items()
+                   if now - s["created_at"] > SESSION_TTL]
+        for sid in expired:
+            del _review_sessions[sid]
+            logger.info(f"Cleaned up expired review session {sid}")
+
+def _create_review_session(items, year=None, month=None):
+    """Create a review session from parsed items. Returns session_id."""
+    session_id = str(uuid.uuid4())[:8]
+
+    # Build questions from items that need clarification
+    questions = []
+    for idx, item in enumerate(items):
+        if item.get("needs_clarification") and item.get("clarification_question"):
+            q_type = item.get("clarification_type", "product_match")
+            options = item.get("clarification_options") or []
+
+            # Always add a skip option
+            if "Skip" not in options and "skip" not in [o.lower() for o in options]:
+                options.append("Skip")
+
+            questions.append({
+                "id": len(questions) + 1,
+                "item_index": idx,
+                "type": q_type,
+                "question": item["clarification_question"],
+                "options": options,
+                "answer": None,
+                "is_answered": False
+            })
+
+    with _sessions_lock:
+        _review_sessions[session_id] = {
+            "id": session_id,
+            "items": items,
+            "questions": questions,
+            "year": year,
+            "month": month,
+            "status": "reviewing" if questions else "ready",
+            "created_at": time.time()
+        }
+
+    logger.info(f"Created review session {session_id}: {len(items)} items, {len(questions)} questions")
+    return session_id
+
+def _get_session(session_id):
+    """Get a session by ID. Returns None if not found."""
+    _cleanup_old_sessions()
+    with _sessions_lock:
+        return _review_sessions.get(session_id)
+
+def _apply_answer(session, question_id, answer):
+    """Apply a user's answer to the corresponding item."""
+    question = None
+    for q in session["questions"]:
+        if q["id"] == question_id:
+            question = q
+            break
+
+    if not question:
+        return False, "Question not found"
+
+    question["answer"] = answer
+    question["is_answered"] = True
+
+    # Apply the answer to the item
+    item_idx = question["item_index"]
+    item = session["items"][item_idx]
+    q_type = question["type"]
+
+    if answer.lower() == "skip":
+        item["needs_clarification"] = False
+        return True, "Skipped"
+
+    if q_type == "product_match":
+        item["description"] = answer
+        item["matched_product_name"] = answer
+        item["needs_clarification"] = False
+
+    elif q_type == "cut_variant":
+        item["description"] = answer
+        item["matched_product_name"] = answer
+        item["needs_clarification"] = False
+
+    elif q_type == "supplier_choice":
+        item["supplier_name"] = answer
+        item["needs_clarification"] = False
+
+    elif q_type == "trimming_loss":
+        try:
+            pct_str = answer.replace("%", "").strip()
+            pct = float(pct_str)
+            if item.get("unit_price") and pct > 0 and pct < 100:
+                item["trimming_loss_pct"] = pct
+                item["original_price"] = item["unit_price"]
+                item["unit_price"] = round(item["unit_price"] / (1 - pct / 100), 2)
+        except (ValueError, TypeError):
+            pass
+        item["needs_clarification"] = False
+
+    elif q_type == "recipe_cost":
+        if answer.lower() in ("yes", "correct", "yes, correct"):
+            item["needs_clarification"] = False
+        else:
+            try:
+                new_val = float(answer.replace("kr", "").replace("SEK", "").strip())
+                item["unit_price"] = new_val
+            except (ValueError, TypeError):
+                pass
+            item["needs_clarification"] = False
+
+    elif q_type == "unit_mismatch":
+        item["needs_clarification"] = False
+
+    else:
+        item["needs_clarification"] = False
+
+    # Check if all questions are answered
+    all_answered = all(q["is_answered"] for q in session["questions"])
+    if all_answered:
+        session["status"] = "ready"
+
+    return True, "Answer applied"
+
+
+# --- Inventory CRUD ----------------------------------------------------------
 
 @inventory_bp.route("/api/inventories", methods=["GET"])
 def list_inventories():
@@ -179,12 +324,10 @@ def list_inventories():
         if month:
             query = query.filter(Inventory.month == month)
         inventories = query.all()
-        # When requesting a specific month, include full items for the detail view
         include_items = month is not None
         return jsonify([inventory_to_dict(inv, include_items=include_items) for inv in inventories])
     finally:
         db.close()
-
 
 @inventory_bp.route("/api/inventories/<int:inv_id>", methods=["GET"])
 def get_inventory(inv_id):
@@ -326,7 +469,7 @@ def update_inventory(inv_id):
 
         inv.updated_at = datetime.utcnow()
         db.commit()
-        inv = db.query(Inventory).filter_by(id=inv_id).first()
+        inv = db.query(Inventory).filter_by(id=inv.id).first()
         return jsonify(inventory_to_dict(inv))
 
     except Exception as e:
@@ -352,20 +495,21 @@ def delete_inventory(inv_id):
         db.close()
 
 
-# âââ Inventory AI Parser (BATCH PROCESSING) ââââââââââââââââââââââââââââââââââ
+# --- Inventory AI Parser (BATCH PROCESSING) ----------------------------------
 
 @inventory_bp.route("/api/inventories/parse", methods=["POST"])
 def parse_inventory_text():
     """
     Parse messy inventory text using AI with BATCH PROCESSING.
-
-    Splits large lists into batches of ~30 items and processes them
-    in parallel for speed. Supports 400+ items without timeout.
+    Now returns a review session with clarification questions.
     """
     db = Session()
     try:
         data = request.get_json()
         raw_text = data.get("text", "").strip()
+        year = data.get("year")
+        month = data.get("month")
+
         if not raw_text:
             return jsonify({"error": "No inventory text provided"}), 400
 
@@ -393,14 +537,12 @@ def parse_inventory_text():
         # Split into batches
         batches = split_text_into_batches(raw_text, BATCH_SIZE)
         total_batches = len(batches)
-
         logger.info(f"Processing inventory: {total_batches} batch(es)")
 
         all_items = []
         errors = []
 
         if total_batches == 1:
-            # Single batch â no need for threading
             try:
                 items = parse_single_batch(
                     batches[0], products_context, recipe_context, 1, 1
@@ -410,7 +552,6 @@ def parse_inventory_text():
                 logger.error(f"Error in single batch: {e}")
                 errors.append(str(e))
         else:
-            # Multiple batches â process in parallel
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
                 future_to_batch = {}
                 for i, batch_text in enumerate(batches):
@@ -421,7 +562,6 @@ def parse_inventory_text():
                     )
                     future_to_batch[future] = i
 
-                # Collect results in order
                 batch_results = [None] * total_batches
                 for future in as_completed(future_to_batch):
                     batch_idx = future_to_batch[future]
@@ -433,14 +573,13 @@ def parse_inventory_text():
                         errors.append(f"Batch {batch_idx + 1}: {str(e)}")
                         batch_results[batch_idx] = []
 
-                # Combine in original order
                 for items in batch_results:
                     if items:
                         all_items.extend(items)
 
         logger.info(f"Total parsed items: {len(all_items)}, errors: {len(errors)}")
 
-        # Enrich with product IDs
+        # Enrich with product IDs and prices
         for item in all_items:
             matched_name = item.get("matched_product_name")
             if matched_name:
@@ -462,7 +601,22 @@ def parse_inventory_text():
                 if recipe:
                     item["recipe_id"] = recipe.id
 
-        result = {"items": all_items}
+        # Create a review session
+        session_id = _create_review_session(all_items, year=year, month=month)
+        session = _get_session(session_id)
+
+        total_questions = len(session["questions"])
+        unanswered = sum(1 for q in session["questions"] if not q["is_answered"])
+
+        result = {
+            "session_id": session_id,
+            "item_count": len(all_items),
+            "items": all_items,
+            "has_questions": total_questions > 0,
+            "total_questions": total_questions,
+            "unanswered_questions": unanswered,
+            "status": session["status"]
+        }
         if errors:
             result["warnings"] = errors
             result["message"] = f"Parsed {len(all_items)} items with {len(errors)} batch error(s)"
@@ -479,7 +633,222 @@ def parse_inventory_text():
         db.close()
 
 
-# âââ Inventory Comparison ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# --- Review Session Endpoints ------------------------------------------------
+
+@inventory_bp.route("/api/inventory/review/<session_id>", methods=["GET"])
+def get_review_status(session_id):
+    """Get review session status and next unanswered question."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    questions = session["questions"]
+    total = len(questions)
+    answered = sum(1 for q in questions if q["is_answered"])
+
+    next_question = None
+    for q in questions:
+        if not q["is_answered"]:
+            next_question = q
+            break
+
+    result = {
+        "session_id": session_id,
+        "status": session["status"],
+        "total_questions": total,
+        "answered_questions": answered,
+        "remaining_questions": total - answered,
+        "progress_pct": round(answered / total * 100) if total > 0 else 100,
+        "current_question": next_question,
+        "item_count": len(session["items"])
+    }
+
+    if session["status"] == "ready":
+        result["items"] = session["items"]
+
+    return jsonify(result)
+
+
+@inventory_bp.route("/api/inventory/review/<session_id>/answer", methods=["POST"])
+def submit_review_answer(session_id):
+    """Submit an answer to a review question."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    data = request.get_json()
+    question_id = data.get("question_id")
+    answer = data.get("answer")
+
+    if not question_id or not answer:
+        return jsonify({"error": "question_id and answer are required"}), 400
+
+    success, message = _apply_answer(session, question_id, answer)
+    if not success:
+        return jsonify({"error": message}), 400
+
+    questions = session["questions"]
+    total = len(questions)
+    answered = sum(1 for q in questions if q["is_answered"])
+
+    next_question = None
+    for q in questions:
+        if not q["is_answered"]:
+            next_question = q
+            break
+
+    return jsonify({
+        "success": True,
+        "message": message,
+        "session_id": session_id,
+        "status": session["status"],
+        "total_questions": total,
+        "answered_questions": answered,
+        "remaining_questions": total - answered,
+        "progress_pct": round(answered / total * 100) if total > 0 else 100,
+        "current_question": next_question
+    })
+
+
+@inventory_bp.route("/api/inventory/review/<session_id>/skip-all", methods=["POST"])
+def skip_all_questions(session_id):
+    """Skip all remaining unanswered questions."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    for q in session["questions"]:
+        if not q["is_answered"]:
+            q["answer"] = "Skip"
+            q["is_answered"] = True
+            item_idx = q["item_index"]
+            session["items"][item_idx]["needs_clarification"] = False
+
+    session["status"] = "ready"
+
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "status": "ready",
+        "items": session["items"]
+    })
+
+
+@inventory_bp.route("/api/inventory/review/<session_id>/items", methods=["GET"])
+def get_session_items(session_id):
+    """Get current items in a review session (for the confirm/edit step)."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    return jsonify({
+        "session_id": session_id,
+        "status": session["status"],
+        "items": session["items"],
+        "item_count": len(session["items"]),
+        "year": session.get("year"),
+        "month": session.get("month")
+    })
+
+
+@inventory_bp.route("/api/inventory/review/<session_id>/items", methods=["PUT"])
+def update_session_items(session_id):
+    """Update items in a review session (user edits before confirming)."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    data = request.get_json()
+    updated_items = data.get("items")
+    if updated_items is not None:
+        session["items"] = updated_items
+
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "item_count": len(session["items"])
+    })
+
+
+@inventory_bp.route("/api/inventory/confirm/<session_id>", methods=["POST"])
+def confirm_review_session(session_id):
+    """
+    Confirm a review session and save to database.
+    Creates the Inventory + InventoryItems from the session data.
+    """
+    session_data = _get_session(session_id)
+    if not session_data:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    data = request.get_json() or {}
+    year = data.get("year") or session_data.get("year") or datetime.utcnow().year
+    month = data.get("month") or session_data.get("month") or datetime.utcnow().month
+    action = data.get("action", "create")
+
+    db = Session()
+    try:
+        existing = db.query(Inventory).filter_by(year=year, month=month).first()
+        if existing and action == "create":
+            return jsonify({
+                "error": "inventory_exists",
+                "message": f"An inventory already exists for {MONTH_NAMES_SV.get(month)} {year}",
+                "existing_id": existing.id,
+                "options": ["replace", "add_to", "cancel"]
+            }), 409
+
+        if existing and action == "replace":
+            db.delete(existing)
+            db.flush()
+
+        if existing and action == "add_to":
+            inv = existing
+        else:
+            inv = Inventory(year=year, month=month, status="draft")
+            db.add(inv)
+            db.flush()
+
+        total = 0
+        for item_data in session_data["items"]:
+            qty = item_data.get("quantity") or 0
+            price = item_data.get("unit_price") or 0
+            line_total = qty * price
+            item = InventoryItem(
+                inventory_id=inv.id,
+                product_id=item_data.get("product_id"),
+                recipe_id=item_data.get("recipe_id"),
+                description=item_data.get("description", ""),
+                quantity=qty,
+                unit=item_data.get("unit"),
+                unit_price=price,
+                is_manual_price=item_data.get("is_manual_price", False),
+                category=item_data.get("category"),
+                supplier_name=item_data.get("supplier_name"),
+                total_value=line_total
+            )
+            db.add(item)
+            total += line_total
+
+        inv.total_value = total
+        inv.updated_at = datetime.utcnow()
+        db.commit()
+
+        # Clean up session
+        with _sessions_lock:
+            if session_id in _review_sessions:
+                del _review_sessions[session_id]
+
+        inv = db.query(Inventory).filter_by(id=inv.id).first()
+        return jsonify(inventory_to_dict(inv)), 201
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error confirming inventory: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# --- Inventory Comparison ----------------------------------------------------
 
 @inventory_bp.route("/api/inventories/compare", methods=["GET"])
 def compare_inventories():
@@ -553,7 +922,7 @@ def compare_inventories():
         db.close()
 
 
-# âââ Inventory Years (for browse navigation) ââââââââââââââââââââââââââââââââ
+# --- Inventory Years (for browse navigation) ---------------------------------
 
 @inventory_bp.route("/api/inventories/years", methods=["GET"])
 def inventory_years():
