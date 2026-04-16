@@ -308,7 +308,7 @@ def init_db():
             if 'description' not in cols:
                 with engine.begin() as conn:
                         conn.execute(text("DROP TABLE inventory_items CASCADE"))
-                    Base.metadata.create_all(engine)
+                Base.metadata.create_all(engine)
     except Exception:
         pass
     return Session()
