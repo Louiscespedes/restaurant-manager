@@ -38,6 +38,7 @@ def run_migrations():
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR",
             "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
+            "ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
         ]
         for sql in migrations:
             try:
