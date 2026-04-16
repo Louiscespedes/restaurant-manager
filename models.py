@@ -305,9 +305,10 @@ def init_db():
         inspector = inspect(engine)
         if 'inventory_items' in inspector.get_table_names():
             cols = [c['name'] for c in inspector.get_columns('inventory_items')]
-            if 'inventory_id' not in cols:
+            if 'description' not in cols:
                 with engine.begin() as conn:
-                    conn.execute(text("ALTER TABLE inventory_items ADD COLUMN inventory_id INTEGER REFERENCES inventories(id) ON DELETE CASCADE"))
+                        conn.execute(text("DROP TABLE inventory_items CASCADE"))
+                    Base.metadata.create_all(engine)
     except Exception:
         pass
     return Session()
