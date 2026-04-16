@@ -298,6 +298,14 @@ class InventoryItem(Base):
 
 
 def init_db():
-    """Create all tables and return a session."""
+    """Create all tables and run migrations."""
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    if 'inventory_items' in inspector.get_table_names():
+        cols = [c['name'] for c in inspector.get_columns('inventory_items')]
+        if 'inventory_id' not in cols:
+            with engine.connect() as conn:
+                conn.execute(text('DROP TABLE inventory_items'))
+                conn.commit()
     Base.metadata.create_all(engine)
     return Session()
