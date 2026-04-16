@@ -291,6 +291,7 @@ class InventoryItem(Base):
     category = Column(String, nullable=True)  # fish, meat, vegetables, dairy, wine, cleaning, prepared, etc.
     supplier_name = Column(String, nullable=True)
     total_value = Column(Float, nullable=True)  # quantity * unit_price
+    trimming_pct = Column(Float, nullable=True, default=0)  # waste/trimming percentage
 
     inventory = relationship('Inventory', back_populates='items')
     product = relationship('Product')
