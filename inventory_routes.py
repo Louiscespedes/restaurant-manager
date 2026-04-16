@@ -167,17 +167,24 @@ Rules:
 
 @inventory_bp.route("/api/inventories", methods=["GET"])
 def list_inventories():
-    """List all inventories, optionally filtered by year."""
+    """List all inventories, optionally filtered by year and/or month.
+    When month is specified, returns full item details for display."""
     db = Session()
     try:
         year = request.args.get("year", type=int)
+        month = request.args.get("month", type=int)
         query = db.query(Inventory).order_by(Inventory.year.desc(), Inventory.month.desc())
         if year:
             query = query.filter(Inventory.year == year)
+        if month:
+            query = query.filter(Inventory.month == month)
         inventories = query.all()
-        return jsonify([inventory_to_dict(inv, include_items=False) for inv in inventories])
+        # When requesting a specific month, include full items for the detail view
+        include_items = month is not None
+        return jsonify([inventory_to_dict(inv, include_items=include_items) for inv in inventories])
     finally:
         db.close()
+
 
 @inventory_bp.route("/api/inventories/<int:inv_id>", methods=["GET"])
 def get_inventory(inv_id):
