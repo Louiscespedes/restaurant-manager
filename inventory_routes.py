@@ -151,7 +151,8 @@ Rules:
 - BE AGGRESSIVE about flagging clarifications -- it's better to ask too many questions than too few
 - If a product name PARTIALLY matches multiple known products, ALWAYS flag as product_match
 - If the user wrote a generic term like "oil", "flour", "fish", "mushroom" etc, flag for clarification
-- When setting unit_price, make sure it matches the item's unit (e.g. if item is in g, price should be per g not per kg)
+- Prices from suppliers are ALWAYS per kg (weight) or per liter (volume) or per piece (st) -- never per gram or ml
+- When setting unit_price, use the per-kg or per-liter price -- the server normalizes quantities automatically
 - Return ONLY valid JSON, no markdown"""
 
     logger.info(f"Processing batch {batch_num}/{total_batches} ...")
@@ -175,34 +176,37 @@ Rules:
     return items
 
 
-def _convert_price_for_unit(price, product_unit, item_unit):
-    """Convert product price to match the item's unit.
-
-    Product prices from Fortnox are typically per-kg, per-liter, or per-piece.
-    If the inventory item is in grams but the price is per-kg, we need to
-    divide by 1000 so that qty_in_grams * price_per_gram = correct value.
+def _normalize_item_unit(item):
+    """Normalize inventory item units to match how prices work.
+    
+    Prices from Fortnox are ALWAYS per kg for weight items, per liter for
+    liquids, and per piece (st) for countable items. Never per gram.
+    
+    So if the AI parser returns 500g, we convert to 0.5 kg so that
+    quantity * price_per_kg gives the correct value.
     """
-    if not price or not item_unit:
-        return price
-
-    iu = item_unit.lower().strip()
-    pu = (product_unit or "").lower().strip()
-
-    # Weight conversions
-    if iu == "g" and pu in ("kg", ""):
-        return round(price / 1000, 6)
-    if iu == "kg" and pu == "g":
-        return round(price * 1000, 2)
-
-    # Volume conversions
-    if iu in ("ml", "cl") and pu in ("liter", "l", ""):
-        divisor = 1000 if iu == "ml" else 100
-        return round(price / divisor, 6)
-    if iu in ("liter", "l") and pu in ("ml", "cl"):
-        multiplier = 1000 if pu == "ml" else 100
-        return round(price * multiplier, 2)
-
-    return price
+    qty = item.get("quantity") or 0
+    unit = (item.get("unit") or "").lower().strip()
+    
+    # Weight: always normalize to kg
+    if unit == "g":
+        item["quantity"] = round(qty / 1000, 4)
+        item["unit"] = "kg"
+    
+    # Volume: always normalize to liter
+    if unit == "ml":
+        item["quantity"] = round(qty / 1000, 4)
+        item["unit"] = "liter"
+    if unit == "cl":
+        item["quantity"] = round(qty / 100, 4)
+        item["unit"] = "liter"
+    
+    # dl -> liter
+    if unit == "dl":
+        item["quantity"] = round(qty / 10, 4)
+        item["unit"] = "liter"
+    
+    return item
 
 
 # --- Review Session Storage (in-memory) --------------------------------------
@@ -613,6 +617,10 @@ def parse_inventory_text():
 
         logger.info(f"Total parsed items: {len(all_items)}, errors: {len(errors)}")
 
+        # Normalize units: g->kg, ml->liter (prices are always per kg/liter)
+        for item in all_items:
+            _normalize_item_unit(item)
+
         # Enrich with product IDs and prices
         for item in all_items:
             matched_name = item.get("matched_product_name")
@@ -623,9 +631,7 @@ def parse_inventory_text():
                 if product:
                     item["product_id"] = product.id
                     if not item.get("unit_price") and product.current_price:
-                        item["unit_price"] = _convert_price_for_unit(
-                            product.current_price, product.unit, item.get("unit")
-                        )
+                        item["unit_price"] = product.current_price
                     if not item.get("supplier_name") and product.supplier:
                         item["supplier_name"] = product.supplier.name
 
