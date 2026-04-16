@@ -380,40 +380,52 @@ def sync_all():
 
 
 def start_auto_sync():
-    """Start auto-sync in a background thread (called on app startup)."""
-    def _auto_sync():
-        try:
-            import time
-            time.sleep(5)
+    """Start auto-sync loop in a background thread (runs every 6 hours)."""
+    SYNC_INTERVAL_HOURS = 6
 
-            db = Session()
-            token = db.query(FortnoxToken).first()
-            db.close()
+    def _auto_sync_loop():
+        import time
+        time.sleep(10)  # Wait for app to fully start
+        logger.info("Auto-sync loop started (every %d hours)", SYNC_INTERVAL_HOURS)
 
-            if not token:
-                logger.info('No Fortnox token found — skipping auto-sync')
-                return
+        while True:
+            try:
+                db = Session()
+                token = db.query(FortnoxToken).first()
+                db.close()
 
-            db = Session()
-            last_log = db.query(SyncLog).filter_by(
-                status='completed'
-            ).order_by(SyncLog.completed_at.desc()).first()
-            db.close()
+                if not token:
+                    logger.info("No Fortnox token found — sleeping %dh", SYNC_INTERVAL_HOURS)
+                    time.sleep(SYNC_INTERVAL_HOURS * 3600)
+                    continue
 
-            if last_log and last_log.completed_at:
-                hours_since = (datetime.utcnow() - last_log.completed_at).total_seconds() / 3600
-                if hours_since < 6:
-                    logger.info(f'Last sync was {hours_since:.1f} hours ago — skipping auto-sync')
-                    return
+                db = Session()
+                last_log = db.query(SyncLog).filter_by(
+                    status='completed'
+                ).order_by(SyncLog.completed_at.desc()).first()
+                db.close()
 
-            logger.info('Starting auto-sync...')
-            sync_all()
+                if last_log and last_log.completed_at:
+                    hours_since = (datetime.utcnow() - last_log.completed_at).total_seconds() / 3600
+                    if hours_since < SYNC_INTERVAL_HOURS:
+                        wait_hours = SYNC_INTERVAL_HOURS - hours_since
+                        logger.info("Last sync was %.1fh ago — sleeping %.1fh", hours_since, wait_hours)
+                        time.sleep(wait_hours * 3600)
+                        continue
 
-        except Exception as e:
-            logger.error(f'Auto-sync error: {e}')
+                logger.info("Auto-sync: starting sync...")
+                sync_all()
+                logger.info("Auto-sync: completed, sleeping %dh", SYNC_INTERVAL_HOURS)
 
-    thread = threading.Thread(target=_auto_sync, daemon=True)
+            except Exception as e:
+                logger.error("Auto-sync error (will retry in 1h): %s", e)
+
+            # Sleep before next check (6h after successful sync, 1h after error)
+            time.sleep(SYNC_INTERVAL_HOURS * 3600)
+
+    thread = threading.Thread(target=_auto_sync_loop, daemon=True)
     thread.start()
+    return thread
     return thread
 """
 Sync service — pulls data from Fortnox and saves it to PostgreSQL.
