@@ -366,6 +366,49 @@ def _apply_answer(session, question_id, answer):
     elif q_type == "unit_mismatch":
         item["needs_clarification"] = False
 
+    elif q_type == "unknown_product":
+        # User told us what this product is - search invoices for it
+        user_product_name = answer.strip()
+        item["description"] = user_product_name
+        item["needs_clarification"] = False
+        # Search product DB for matches
+        db = Session()
+        try:
+            search_term = f"%{user_product_name}%"
+            matches = db.query(Product).filter(
+                func.lower(Product.name).like(func.lower(search_term))
+            ).limit(5).all()
+            if len(matches) == 1:
+                product = matches[0]
+                item["matched_product_name"] = product.name
+                item["product_id"] = product.id
+                item["unit_price"] = product.latest_price or 0
+                item["supplier_name"] = product.supplier.name if product.supplier else None
+                item["matched_product_confidence"] = "high"
+            elif len(matches) > 1:
+                options = []
+                for p in matches:
+                    price_str = f"{p.latest_price:.2f} SEK" if p.latest_price else "no price"
+                    supplier_str = p.supplier.name if p.supplier else "unknown"
+                    options.append(f"{p.name} - {price_str} ({supplier_str})")
+                options.append("Skip")
+                new_q = {
+                    "id": max(q["id"] for q in session["questions"]) + 1,
+                    "item_index": item_idx,
+                    "type": "product_match",
+                    "item_description": user_product_name,
+                    "question": f"Found {len(matches)} products matching '{user_product_name}'. Which one?",
+                    "options": options,
+                    "answer": None,
+                    "is_answered": False
+                }
+                current_pos = session["questions"].index(question)
+                session["questions"].insert(current_pos + 1, new_q)
+            else:
+                item["matched_product_confidence"] = "none"
+        finally:
+            db.close()
+
     else:
         item["needs_clarification"] = False
 
@@ -375,6 +418,57 @@ def _apply_answer(session, question_id, answer):
         session["status"] = "ready"
 
     return True, "Answer applied"
+
+
+# --- Review Navigation -------------------------------------------------------
+
+@inventory_bp.route("/api/inventory/review/<session_id>/go-back", methods=["POST"])
+def review_go_back(session_id):
+    """Go back to the previous question in the review."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+
+    data = request.get_json() or {}
+    current_question_id = data.get("current_question_id")
+
+    questions = session["questions"]
+    previous_question = None
+
+    if current_question_id:
+        current_idx = None
+        for i, q in enumerate(questions):
+            if q["id"] == current_question_id:
+                current_idx = i
+                break
+
+        if current_idx is not None and current_idx > 0:
+            for i in range(current_idx - 1, -1, -1):
+                if questions[i]["is_answered"]:
+                    previous_question = questions[i]
+                    previous_question["is_answered"] = False
+                    previous_question["answer"] = None
+                    item_idx = previous_question["item_index"]
+                    item = session["items"][item_idx]
+                    item["needs_clarification"] = True
+                    break
+
+    if not previous_question:
+        return jsonify({"error": "No previous question to go back to"}), 400
+
+    total = len(questions)
+    answered = sum(1 for q in questions if q["is_answered"])
+
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "status": "reviewing",
+        "total_questions": total,
+        "answered_questions": answered,
+        "remaining_questions": total - answered,
+        "progress_pct": round(answered / total * 100) if total > 0 else 0,
+        "current_question": previous_question
+    })
 
 
 # --- Inventory CRUD ----------------------------------------------------------
