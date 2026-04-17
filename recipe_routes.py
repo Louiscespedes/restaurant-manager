@@ -48,10 +48,8 @@ def calc_recipe_cost(recipe, ingredients=None):
         price = ing.unit_price or 0
         qty = ing.quantity or 0
         trim = ing.trimming_percent or 0
-        # Convert price to match ingredient unit (invoice prices are per kg/liter)
-        unit = ing.unit if hasattr(ing, 'unit') else 'kg'
-        converted_price = _convert_price_to_ingredient_unit(price, unit)
-        effective_price = converted_price / (1 - trim / 100) if trim < 100 else converted_price
+        # Prices are stored pre-converted to ingredient unit at parse/save time
+        effective_price = price / (1 - trim / 100) if trim < 100 else price
         subtotal += qty * effective_price
 
     seasoning = subtotal * (recipe.seasoning_cost_percent or 0) / 100
@@ -381,9 +379,12 @@ Return ONLY valid JSON, no markdown formatting."""
                 ).first()
                 if product:
                     ing["product_id"] = product.id
-                    # Store price per kg/liter (from invoice) — calc_recipe_cost handles unit conversion
-                    ing["unit_price"] = product.current_price
-                    ing["price_unit"] = product.unit or "kg"
+                    # Pre-convert price from per-kg/liter to per ingredient unit
+                    raw_price = product.current_price or 0
+                    ing_unit = ing.get("unit", "kg")
+                    ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
+                    ing["raw_price_per_base_unit"] = raw_price
+                    ing["price_unit"] = ing_unit
                     ing["supplier_name"] = product.supplier.name if product.supplier else None
                 else:
                     ing["product_id"] = None
