@@ -17,6 +17,27 @@ recipe_bp = Blueprint('recipes', __name__)
 
 # ─── Helper: calculate recipe cost ──────────────────────────────────────────
 
+def _convert_price_to_ingredient_unit(price_per_base, ingredient_unit, product_unit=None):
+    """Convert price from invoice unit (kg/liter) to ingredient unit (g/ml/cl/etc).
+    Invoice prices are always per kg or per liter. If the recipe uses g, ml, etc.,
+    we need to convert so that qty * price gives the correct line cost.
+    Returns price per ingredient unit."""
+    if not price_per_base or not ingredient_unit:
+        return price_per_base or 0
+    iu = ingredient_unit.lower().strip()
+    # If ingredient is in g but price is per kg -> divide by 1000
+    if iu == 'g':
+        return price_per_base / 1000
+    # If ingredient is in ml -> price per liter / 1000
+    elif iu == 'ml':
+        return price_per_base / 1000
+    # If ingredient is in cl -> price per liter / 100
+    elif iu == 'cl':
+        return price_per_base / 100
+    # kg, liter, st -> price is already correct
+    return price_per_base
+
+
 def calc_recipe_cost(recipe, ingredients=None):
     """Calculate total cost, per-portion cost, and food cost % for a recipe."""
     if ingredients is None:
@@ -27,7 +48,10 @@ def calc_recipe_cost(recipe, ingredients=None):
         price = ing.unit_price or 0
         qty = ing.quantity or 0
         trim = ing.trimming_percent or 0
-        effective_price = price / (1 - trim / 100) if trim < 100 else price
+        # Convert price to match ingredient unit (invoice prices are per kg/liter)
+        unit = ing.unit if hasattr(ing, 'unit') else 'kg'
+        converted_price = _convert_price_to_ingredient_unit(price, unit)
+        effective_price = converted_price / (1 - trim / 100) if trim < 100 else converted_price
         subtotal += qty * effective_price
 
     seasoning = subtotal * (recipe.seasoning_cost_percent or 0) / 100
@@ -357,7 +381,9 @@ Return ONLY valid JSON, no markdown formatting."""
                 ).first()
                 if product:
                     ing["product_id"] = product.id
+                    # Store price per kg/liter (from invoice) — calc_recipe_cost handles unit conversion
                     ing["unit_price"] = product.current_price
+                    ing["price_unit"] = product.unit or "kg"
                     ing["supplier_name"] = product.supplier.name if product.supplier else None
                 else:
                     ing["product_id"] = None
