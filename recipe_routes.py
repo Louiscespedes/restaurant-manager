@@ -137,9 +137,33 @@ def _apply_recipe_answer(session, question_id, answer):
         ing["needs_clarification"] = False
         db = Session()
         try:
+            # Step 1: Direct ILIKE search
             matches = db.query(Product).filter(
                 Product.name.ilike(f"%{user_product_name[:30]}%")
-            ).limit(5).all()
+            ).limit(10).all()
+            # Step 2: If no direct match, try cross-language AI translation
+            if not matches:
+                try:
+                    import anthropic as anth_unknown
+                    client_unknown = anth_unknown.Anthropic()
+                    translate_resp = client_unknown.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=200,
+                        messages=[{"role": "user", "content": f"""Translate this food/ingredient term to Swedish, English, and French. Return ONLY a JSON array of search terms (lowercase, no explanations). Example: ["potatis", "potato", "pomme de terre"]\n\nTerm: {user_product_name}"""}]
+                    )
+                    import json as json_unknown
+                    terms_text = translate_resp.content[0].text.strip()
+                    if terms_text.startswith("["):
+                        search_terms = json_unknown.loads(terms_text)
+                    else:
+                        search_terms = [user_product_name]
+                    from sqlalchemy import or_ as or_unknown
+                    conditions = [Product.name.ilike(f"%{term}%") for term in search_terms]
+                    matches = db.query(Product).filter(
+                        or_unknown(*conditions)
+                    ).limit(10).all()
+                except Exception as e:
+                    logger.error(f"Cross-language search failed in unknown_product: {e}")
             if len(matches) == 1:
                 product = matches[0]
                 ing["product_id"] = product.id
