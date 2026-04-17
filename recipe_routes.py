@@ -8,7 +8,8 @@ import time
 import threading
 from flask import Blueprint, request, jsonify
 from datetime import datetime
-from sqlalchemy import func
+from sqlalchemy import func, or_
+from food_dictionary import search_food_terms
 from models import (
     Session, Recipe, RecipeIngredient, Dish, DishComponent,
     Menu, MenuItem, Product, InvoiceLineItem, PriceHistory
@@ -588,26 +589,46 @@ Return ONLY valid JSON, no markdown formatting."""
 
         parsed = json.loads(result_text)
 
-        # Enrich with product IDs and prices
+        # Enrich with product IDs and prices (with cross-language fallback)
         for ing in parsed.get("ingredients", []):
             matched_name = ing.get("matched_product_name")
+            product = None
+
             if matched_name:
-                # Find the product in DB
+                # Step 1: Try direct ILIKE on the AI's suggested match
                 product = db.query(Product).filter(
                     Product.name.ilike(f"%{matched_name[:30]}%")
                 ).first()
-                if product:
-                    ing["product_id"] = product.id
-                    # Pre-convert price from per-kg/liter to per ingredient unit
-                    raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
-                    ing_unit = ing.get("unit", "kg")
-                    ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
-                    ing["raw_price_per_base_unit"] = raw_price
-                    ing["price_unit"] = ing_unit
-                    ing["supplier_name"] = product.supplier.name if product.supplier else None
-                else:
-                    ing["product_id"] = None
-                    ing["unit_price"] = None
+
+            if not product:
+                # Step 2: Cross-language fallback using food dictionary
+                search_term = matched_name or ing.get("description", "")
+                if search_term:
+                    bilingual_terms = search_food_terms(search_term)
+                    if len(bilingual_terms) > 1:
+                        conditions = [
+                            Product.name.ilike(f"%{term}%")
+                            for term in bilingual_terms
+                        ]
+                        product = db.query(Product).filter(
+                            or_(*conditions)
+                        ).first()
+
+            if product:
+                ing["product_id"] = product.id
+                ing["matched_product_name"] = product.name
+                # Pre-convert price from per-kg/liter to per ingredient unit
+                raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
+                ing_unit = ing.get("unit", "kg")
+                ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
+                ing["raw_price_per_base_unit"] = raw_price
+                ing["price_unit"] = ing_unit
+                ing["supplier_name"] = product.supplier.name if product.supplier else None
+                ing["needs_clarification"] = False
+                ing["matched_product_confidence"] = ing.get("matched_product_confidence") or "medium"
+            else:
+                ing["product_id"] = None
+                ing["unit_price"] = None
 
 
         # Smart enrichment: for clarification items, search products to provide real options
