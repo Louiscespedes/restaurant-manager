@@ -1274,7 +1274,6 @@ Term: {query}"""}]
                 "supplier_id": p.supplier_id,
                 "supplier_name": p.supplier.name if p.supplier else None,
                 "unit": p.unit,
-                "latest_price": p.latest_price,
                 "current_price": pkg_price,
                 "raw_invoice_price": p.current_price,
                 "category": p.category
