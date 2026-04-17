@@ -1280,6 +1280,10 @@ Term: {query}"""}]
                 "category": p.category
             })
         return jsonify(results)
+    except Exception as e:
+        import traceback
+        logger.error(f"Search products error: {traceback.format_exc()}")
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
     finally:
         db.close()
 
