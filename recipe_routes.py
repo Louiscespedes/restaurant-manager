@@ -557,6 +557,64 @@ Return ONLY valid JSON, no markdown formatting."""
                     ing["product_id"] = None
                     ing["unit_price"] = None
 
+
+        # Smart enrichment: for clarification items, search products to provide real options
+        for ing in parsed.get("ingredients", []):
+            if not ing.get("needs_clarification"):
+                continue
+            options = ing.get("clarification_options") or []
+            # Remove "Skip" to check if there are real options
+            real_options = [o for o in options if o.lower() != "skip"]
+            if real_options:
+                continue  # AI already provided options, keep them
+
+            # No real options — search products using description
+            desc = ing.get("description", "")
+            if not desc:
+                continue
+
+            # Try direct DB search first
+            search_term = f"%{desc[:30]}%"
+            matches = db.query(Product).filter(
+                Product.name.ilike(search_term)
+            ).limit(10).all()
+
+            # If no direct match, try cross-language search with AI
+            if not matches:
+                try:
+                    import anthropic as anth_search
+                    search_client = anth_search.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+                    translate_resp = search_client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=200,
+                        messages=[{"role": "user", "content": f"Translate this food/ingredient term into Swedish, French, and English. Return ONLY a JSON array of search terms. Term: {desc}"}]
+                    )
+                    terms_text = translate_resp.content[0].text.strip()
+                    if terms_text.startswith("["):
+                        search_terms = json.loads(terms_text)
+                        from sqlalchemy import or_
+                        conditions = [Product.name.ilike(f"%{t}%") for t in search_terms]
+                        matches = db.query(Product).filter(or_(*conditions)).limit(10).all()
+                except Exception as e:
+                    logger.error(f"Cross-language search failed for '{desc}': {e}")
+
+            if matches:
+                # Build options with price and supplier info
+                new_options = []
+                for p in matches:
+                    price_str = f"{p.current_price:.2f} SEK/{p.unit or 'kg'}" if p.current_price else "no price"
+                    supplier_str = p.supplier.name if p.supplier else "unknown"
+                    new_options.append(f"{p.name} - {price_str} ({supplier_str})")
+                new_options.append("Skip")
+                ing["clarification_options"] = new_options
+                ing["clarification_type"] = "product_match"
+                ing["clarification_question"] = f"Which product matches '{desc}'?"
+            else:
+                # Truly unknown — change to unknown_product type so frontend shows text input
+                ing["clarification_type"] = "unknown_product"
+                ing["clarification_question"] = f"I couldn't find '{desc}' in your invoices. What product is this?"
+                ing["clarification_options"] = ["Type the product name"]
+
         # Create a review session
         ingredients = parsed.get("ingredients", [])
         session_id = _create_recipe_review_session(parsed, ingredients)
