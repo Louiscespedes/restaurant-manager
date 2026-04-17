@@ -103,7 +103,7 @@ def _apply_recipe_answer(session, question_id, answer):
                 ).first()
             if product:
                 ing["product_id"] = product.id
-                raw_price = product.current_price or 0
+                raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
                 ing_unit = ing.get("unit", "kg")
                 ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
                 ing["raw_price_per_base_unit"] = raw_price
@@ -125,7 +125,7 @@ def _apply_recipe_answer(session, question_id, answer):
                 ).first()
                 if product:
                     ing["product_id"] = product.id
-                    raw_price = product.current_price or 0
+                    raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
                     ing_unit = ing.get("unit", "kg")
                     ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
                     ing["raw_price_per_base_unit"] = raw_price
@@ -167,7 +167,7 @@ def _apply_recipe_answer(session, question_id, answer):
             if len(matches) == 1:
                 product = matches[0]
                 ing["product_id"] = product.id
-                raw_price = product.current_price or 0
+                raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
                 ing_unit = ing.get("unit", "kg")
                 ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
                 ing["raw_price_per_base_unit"] = raw_price
@@ -203,6 +203,34 @@ def _apply_recipe_answer(session, question_id, answer):
 
 
 # ─── Helper: calculate recipe cost ──────────────────────────────────────────
+
+def _adjust_price_for_package_size(product_name, price):
+    """Detect package sizes in product names and return true per-unit price.
+    E.g., 'Salt fint med jod Jozo 1x10 kg DK' at 205 kr -> 20.50 kr/kg
+    'Rapsolja Zeta 1x1 L' at 35.90 kr -> 35.90 kr/L (no change)
+    """
+    import re
+    if not product_name or not price:
+        return price or 0
+    name_lower = product_name.lower()
+    # Pattern: NxM unit (e.g., "1x10 kg", "6x1 l", "2x5 kg")
+    match = re.search(r'(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*(?:kg|l|liter|litre)\b', name_lower)
+    if match:
+        packs = int(match.group(1))
+        size = float(match.group(2).replace(',', '.'))
+        total_units = packs * size
+        if total_units > 1:
+            return round(price / total_units, 4)
+        return price
+    # Pattern: standalone large size like "10 kg", "5L" (but NOT "3%" or unit descriptions)
+    match = re.search(r'(?:^|\s)(\d+(?:[.,]\d+)?)\s*(?:kg|l|liter|litre)\b', name_lower)
+    if match:
+        size = float(match.group(1).replace(',', '.'))
+        # Only adjust if size > 1 (avoids "1 kg" = no adjustment)
+        if size > 1:
+            return round(price / size, 4)
+    return price
+
 
 def _convert_price_to_ingredient_unit(price_per_base, ingredient_unit, product_unit=None):
     """Convert price from invoice unit (kg/liter) to ingredient unit (g/ml/cl/etc).
@@ -571,7 +599,7 @@ Return ONLY valid JSON, no markdown formatting."""
                 if product:
                     ing["product_id"] = product.id
                     # Pre-convert price from per-kg/liter to per ingredient unit
-                    raw_price = product.current_price or 0
+                    raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
                     ing_unit = ing.get("unit", "kg")
                     ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
                     ing["raw_price_per_base_unit"] = raw_price
@@ -1193,9 +1221,10 @@ def dish_categories():
 def search_products_smart():
     """Search products with cross-language support (EN/SV/FR).
     First tries direct DB match, then uses AI translation if no results.
-    Query param: ?q=lobster
+    Query params: ?q=lobster&fast=1 (fast skips AI translation)
     """
     query = request.args.get("q", "").strip()
+    fast_mode = request.args.get("fast", "0") == "1"
     if not query or len(query) < 2:
         return jsonify([])
 
@@ -1207,8 +1236,8 @@ def search_products_smart():
             Product.name.ilike(search_term)
         ).order_by(Product.name).limit(20).all()
 
-        # Step 2: If no direct match, use AI to translate and search
-        if not products:
+        # Step 2: If no direct match and not fast mode, use AI to translate and search
+        if not products and not fast_mode:
             try:
                 client = anthropic.Anthropic()
                 translate_response = client.messages.create(
@@ -1238,6 +1267,7 @@ Term: {query}"""}]
 
         results = []
         for p in products:
+            pkg_price = _adjust_price_for_package_size(p.name, p.current_price or 0)
             results.append({
                 "id": p.id,
                 "name": p.name,
@@ -1245,7 +1275,8 @@ Term: {query}"""}]
                 "supplier_name": p.supplier.name if p.supplier else None,
                 "unit": p.unit,
                 "latest_price": p.latest_price,
-                "current_price": p.current_price,
+                "current_price": pkg_price,
+                "raw_invoice_price": p.current_price,
                 "category": p.category
             })
         return jsonify(results)
