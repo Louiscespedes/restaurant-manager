@@ -3,8 +3,12 @@ Recipe, Dish, and Menu API routes.
 Register with: app.register_blueprint(recipe_bp)
 """
 import logging
+import uuid
+import time
+import threading
 from flask import Blueprint, request, jsonify
 from datetime import datetime
+from sqlalchemy import func
 from models import (
     Session, Recipe, RecipeIngredient, Dish, DishComponent,
     Menu, MenuItem, Product, InvoiceLineItem, PriceHistory
@@ -13,6 +17,165 @@ from models import (
 logger = logging.getLogger(__name__)
 
 recipe_bp = Blueprint('recipes', __name__)
+
+# ─── Recipe Review Session Storage (in-memory) ─────────────────────────────
+_recipe_review_sessions = {}
+_recipe_sessions_lock = threading.Lock()
+RECIPE_SESSION_TTL = 7200  # 2 hours
+
+def _cleanup_recipe_sessions():
+    now = time.time()
+    with _recipe_sessions_lock:
+        expired = [sid for sid, s in _recipe_review_sessions.items()
+                   if now - s["created_at"] > RECIPE_SESSION_TTL]
+        for sid in expired:
+            del _recipe_review_sessions[sid]
+
+def _create_recipe_review_session(parsed_data, ingredients):
+    session_id = str(uuid.uuid4())[:8]
+    questions = []
+    for idx, ing in enumerate(ingredients):
+        if ing.get("needs_clarification") and ing.get("clarification_question"):
+            q_type = ing.get("clarification_type", "product_match")
+            options = ing.get("clarification_options") or []
+            if "Skip" not in options:
+                options.append("Skip")
+            item_name = ing.get("description") or "Unknown"
+            question_text = ing["clarification_question"]
+            if item_name.lower() not in question_text.lower():
+                question_text = f"[{item_name}] {question_text}"
+            questions.append({
+                "id": len(questions) + 1,
+                "item_index": idx,
+                "type": q_type,
+                "item_description": item_name,
+                "question": question_text,
+                "options": options,
+                "answer": None,
+                "is_answered": False
+            })
+    with _recipe_sessions_lock:
+        _recipe_review_sessions[session_id] = {
+            "id": session_id,
+            "parsed": parsed_data,
+            "ingredients": ingredients,
+            "questions": questions,
+            "status": "reviewing" if questions else "ready",
+            "created_at": time.time()
+        }
+    logger.info(f"Recipe review session {session_id}: {len(ingredients)} ingredients, {len(questions)} questions")
+    return session_id
+
+def _get_recipe_session(session_id):
+    _cleanup_recipe_sessions()
+    with _recipe_sessions_lock:
+        return _recipe_review_sessions.get(session_id)
+
+def _apply_recipe_answer(session, question_id, answer):
+    question = None
+    for q in session["questions"]:
+        if q["id"] == question_id:
+            question = q
+            break
+    if not question:
+        return False, "Question not found"
+    question["answer"] = answer
+    question["is_answered"] = True
+    item_idx = question["item_index"]
+    ing = session["ingredients"][item_idx]
+    q_type = question["type"]
+    if answer.lower() == "skip":
+        ing["needs_clarification"] = False
+        return True, "Skipped"
+    if q_type in ("product_match", "cut_variant"):
+        clean_name = answer.split(" - ")[0].split(" (")[0].strip()
+        ing["matched_product_name"] = clean_name
+        ing["needs_clarification"] = False
+        # Re-lookup product to get price
+        db = Session()
+        try:
+            product = db.query(Product).filter(
+                func.lower(Product.name) == clean_name.lower().strip()
+            ).first()
+            if not product:
+                product = db.query(Product).filter(
+                    Product.name.ilike(f"%{clean_name[:30]}%")
+                ).first()
+            if product:
+                ing["product_id"] = product.id
+                raw_price = product.current_price or 0
+                ing_unit = ing.get("unit", "kg")
+                ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
+                ing["raw_price_per_base_unit"] = raw_price
+                ing["supplier_name"] = product.supplier.name if product.supplier else None
+        finally:
+            db.close()
+    elif q_type == "supplier_choice":
+        ing["supplier_name"] = answer
+        ing["needs_clarification"] = False
+        # Re-lookup with supplier
+        db = Session()
+        try:
+            from models import Supplier
+            supplier = db.query(Supplier).filter(Supplier.name.ilike(f"%{answer[:30]}%")).first()
+            if supplier:
+                product = db.query(Product).filter(
+                    Product.name.ilike(f"%{ing.get('matched_product_name', '')[:30]}%"),
+                    Product.supplier_id == supplier.id
+                ).first()
+                if product:
+                    ing["product_id"] = product.id
+                    raw_price = product.current_price or 0
+                    ing_unit = ing.get("unit", "kg")
+                    ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
+                    ing["raw_price_per_base_unit"] = raw_price
+        finally:
+            db.close()
+    elif q_type == "unknown_product":
+        user_product_name = answer.strip()
+        ing["description"] = user_product_name
+        ing["needs_clarification"] = False
+        db = Session()
+        try:
+            matches = db.query(Product).filter(
+                Product.name.ilike(f"%{user_product_name[:30]}%")
+            ).limit(5).all()
+            if len(matches) == 1:
+                product = matches[0]
+                ing["product_id"] = product.id
+                raw_price = product.current_price or 0
+                ing_unit = ing.get("unit", "kg")
+                ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
+                ing["raw_price_per_base_unit"] = raw_price
+                ing["supplier_name"] = product.supplier.name if product.supplier else None
+            elif len(matches) > 1:
+                options = []
+                for p in matches:
+                    price_str = f"{p.current_price:.2f} SEK" if p.current_price else "no price"
+                    supplier_str = p.supplier.name if p.supplier else "unknown"
+                    options.append(f"{p.name} - {price_str} ({supplier_str})")
+                options.append("Skip")
+                new_q = {
+                    "id": max(q["id"] for q in session["questions"]) + 1,
+                    "item_index": item_idx,
+                    "type": "product_match",
+                    "item_description": user_product_name,
+                    "question": f"Found {len(matches)} products matching '{user_product_name}'. Which one?",
+                    "options": options,
+                    "answer": None,
+                    "is_answered": False
+                }
+                current_pos = session["questions"].index(question)
+                session["questions"].insert(current_pos + 1, new_q)
+        finally:
+            db.close()
+    else:
+        ing["needs_clarification"] = False
+    all_answered = all(q["is_answered"] for q in session["questions"])
+    if all_answered:
+        session["status"] = "ready"
+    return True, "Answer applied"
+
 
 
 # ─── Helper: calculate recipe cost ──────────────────────────────────────────
@@ -346,7 +509,11 @@ Be smart about matching:
 - "morötter" = "carrots" = "carottes" — match across languages
 - If multiple suppliers sell the same product, set needs_clarification=true and ask which supplier
 - If a product seems like a finished item (ice cream, bread), note it may need a recipe
-- Suggest trimming percentages for common items (20% for fish, 15% for meat, 10% for vegetables, etc.)
+- Suggest trimming percentages for common items
+- BE AGGRESSIVE about flagging clarifications — better to ask than guess wrong
+- If multiple suppliers sell the same product, set needs_clarification=true, type="supplier_choice", and list supplier names as options
+- If a product name matches multiple items, set type="product_match" and list the options
+- If you cannot identify a product, set type="unknown_product" (20% for fish, 15% for meat, 10% for vegetables, etc.)
 - Normalize all units consistently (convert tbsp to ml, cups to dl, etc.)
 
 - IMPORTANT: Extract ALL cooking instructions, method steps, and preparation notes into the "notes" field. Lines starting with "-" or describing cooking methods/techniques are NOT ingredients — they go into notes. Include the full process/method.
@@ -390,7 +557,25 @@ Return ONLY valid JSON, no markdown formatting."""
                     ing["product_id"] = None
                     ing["unit_price"] = None
 
-        return jsonify(parsed)
+        # Create a review session
+        ingredients = parsed.get("ingredients", [])
+        session_id = _create_recipe_review_session(parsed, ingredients)
+        session = _get_recipe_session(session_id)
+        total_questions = len(session["questions"])
+        unanswered = sum(1 for q in session["questions"] if not q["is_answered"])
+
+        return jsonify({
+            "session_id": session_id,
+            "name": parsed.get("name"),
+            "category": parsed.get("category"),
+            "portions": parsed.get("portions"),
+            "notes": parsed.get("notes"),
+            "ingredients": ingredients,
+            "has_questions": total_questions > 0,
+            "total_questions": total_questions,
+            "unanswered_questions": unanswered,
+            "status": session["status"]
+        })
 
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse AI response as JSON: {e}")
@@ -401,6 +586,143 @@ Return ONLY valid JSON, no markdown formatting."""
     finally:
         db.close()
 
+
+
+
+# ─── Recipe Review Session Endpoints ───────────────────────────────────────
+
+@recipe_bp.route("/api/recipes/review/<session_id>", methods=["GET"])
+def get_recipe_review_status(session_id):
+    session = _get_recipe_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+    questions = session["questions"]
+    total = len(questions)
+    answered = sum(1 for q in questions if q["is_answered"])
+    next_question = None
+    for q in questions:
+        if not q["is_answered"]:
+            next_question = q
+            break
+    result = {
+        "session_id": session_id,
+        "status": session["status"],
+        "total_questions": total,
+        "answered_questions": answered,
+        "remaining_questions": total - answered,
+        "progress_pct": round(answered / total * 100) if total > 0 else 100,
+        "current_question": next_question,
+        "ingredient_count": len(session["ingredients"])
+    }
+    if session["status"] == "ready":
+        result["parsed"] = session["parsed"]
+        result["ingredients"] = session["ingredients"]
+    return jsonify(result)
+
+@recipe_bp.route("/api/recipes/review/<session_id>/answer", methods=["POST"])
+def submit_recipe_review_answer(session_id):
+    session = _get_recipe_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+    data = request.get_json()
+    question_id = data.get("question_id")
+    answer = data.get("answer")
+    if not question_id or not answer:
+        return jsonify({"error": "question_id and answer are required"}), 400
+    success, message = _apply_recipe_answer(session, question_id, answer)
+    if not success:
+        return jsonify({"error": message}), 400
+    questions = session["questions"]
+    total = len(questions)
+    answered = sum(1 for q in questions if q["is_answered"])
+    next_question = None
+    for q in questions:
+        if not q["is_answered"]:
+            next_question = q
+            break
+    return jsonify({
+        "success": True,
+        "message": message,
+        "session_id": session_id,
+        "status": session["status"],
+        "total_questions": total,
+        "answered_questions": answered,
+        "remaining_questions": total - answered,
+        "progress_pct": round(answered / total * 100) if total > 0 else 100,
+        "current_question": next_question
+    })
+
+@recipe_bp.route("/api/recipes/review/<session_id>/go-back", methods=["POST"])
+def recipe_review_go_back(session_id):
+    session = _get_recipe_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+    data = request.get_json() or {}
+    current_question_id = data.get("current_question_id")
+    questions = session["questions"]
+    previous_question = None
+    if current_question_id:
+        current_idx = None
+        for i, q in enumerate(questions):
+            if q["id"] == current_question_id:
+                current_idx = i
+                break
+        if current_idx is not None and current_idx > 0:
+            for i in range(current_idx - 1, -1, -1):
+                if questions[i]["is_answered"]:
+                    previous_question = questions[i]
+                    previous_question["is_answered"] = False
+                    previous_question["answer"] = None
+                    ing = session["ingredients"][previous_question["item_index"]]
+                    ing["needs_clarification"] = True
+                    break
+    if not previous_question:
+        return jsonify({"error": "No previous question to go back to"}), 400
+    total = len(questions)
+    answered = sum(1 for q in questions if q["is_answered"])
+    session["status"] = "reviewing"
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "status": "reviewing",
+        "total_questions": total,
+        "answered_questions": answered,
+        "remaining_questions": total - answered,
+        "progress_pct": round(answered / total * 100) if total > 0 else 0,
+        "current_question": previous_question
+    })
+
+@recipe_bp.route("/api/recipes/review/<session_id>/skip-all", methods=["POST"])
+def skip_all_recipe_questions(session_id):
+    session = _get_recipe_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+    for q in session["questions"]:
+        if not q["is_answered"]:
+            q["answer"] = "Skip"
+            q["is_answered"] = True
+            session["ingredients"][q["item_index"]]["needs_clarification"] = False
+    session["status"] = "ready"
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "status": "ready",
+        "parsed": session["parsed"],
+        "ingredients": session["ingredients"]
+    })
+
+@recipe_bp.route("/api/recipes/review/<session_id>/ingredients", methods=["GET"])
+def get_recipe_session_ingredients(session_id):
+    session = _get_recipe_session(session_id)
+    if not session:
+        return jsonify({"error": "Review session not found or expired"}), 404
+    return jsonify({
+        "session_id": session_id,
+        "status": session["status"],
+        "parsed": session["parsed"],
+        "ingredients": session["ingredients"],
+        "ingredient_count": len(session["ingredients"])
+    })
 
 # ─── Dishes CRUD ─────────────────────────────────────────────────────────────
 
