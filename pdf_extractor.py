@@ -39,7 +39,7 @@ Invoice number: {invoice_number}
 
 For each product line, extract:
 - article_number: the supplier's article/product number (Art nummer, Artikelnr, etc.)
-- description: the product name/description (Produktbeskrivning, Benamning, etc.)
+- description: the FULL product description exactly as shown on the invoice, including brand, size, pack info, and country code (e.g. "Ägg M frigående Sysco Classic 8x20 st SE"). Do NOT shorten or clean up the description — keep ALL text from the product line.
 - quantity: the amount ordered (Antal, Kvantitet, Levererat, etc.) — use the DELIVERED quantity if both ordered and delivered are shown
 - unit: the unit of measure (kg, st, liter, forp, etc.)
 - unit_price: price per unit (A-pris, Pris, etc.) — this should be the price EXCLUDING VAT
