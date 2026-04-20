@@ -460,6 +460,7 @@ def get_invoice(invoice_id):
                 "unit_price": li.unit_price,
                 "total": li.total,
                 "package_weight_grams": li.package_weight_grams,
+                "package_quantity": li.package_quantity,
                 "product_id": li.product_id
             } for li in line_items]
         })
