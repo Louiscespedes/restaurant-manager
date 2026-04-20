@@ -220,6 +220,10 @@ def extract_invoice_products(invoice_id=None, force=False):
                 pkg_weight = prod_data.get('package_weight_grams')
                 pkg_quantity = prod_data.get('package_quantity')
 
+                # Debug logging for package_quantity extraction
+                if pkg_quantity is not None or (unit and unit.upper() in ('FRP', 'KRT', 'KARTONG', 'BACK', 'LDA')):
+                    logger.info(f'DEBUG pkg_quantity: article={article_number} desc="{description}" unit={unit} pkg_qty_raw={prod_data.get("package_quantity")} pkg_qty={pkg_quantity}')
+
                 if not description and not article_number:
                     continue
 
