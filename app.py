@@ -36,8 +36,10 @@ def run_migrations():
     try:
         migrations = [
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS package_quantity FLOAT",
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR",
             "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
+            "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_quantity FLOAT",
             "ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
         ]
         for sql in migrations:
@@ -350,6 +352,7 @@ def search_products():
                 )
 
             normalized_price_per_kg = None
+            price_per_piece = None
             if prod.current_price and prod.current_price > 0:
                 unit_lower = (prod.unit or "").lower()
                 if unit_lower == "kg":
@@ -361,6 +364,10 @@ def search_products():
                         prod.current_price / (prod.package_weight_grams / 1000), 2
                     )
 
+                # For bulk packages (FRP, KRT, etc.), calculate per-piece price
+                if prod.package_quantity and prod.package_quantity > 0:
+                    price_per_piece = round(prod.current_price / prod.package_quantity, 4)
+
             results.append({
                 "id": prod.id,
                 "name": prod.name,
@@ -371,6 +378,8 @@ def search_products():
                 "category": prod.category,
                 "current_price": prod.current_price,
                 "package_weight_grams": prod.package_weight_grams,
+                "package_quantity": prod.package_quantity,
+                "price_per_piece": price_per_piece,
                 "normalized_price_per_kg": normalized_price_per_kg,
                 "price_change_percent": price_change,
                 "matched_terms": list(search_terms)[:5]
