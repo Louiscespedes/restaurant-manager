@@ -569,6 +569,13 @@ Be smart about matching:
 - If you cannot identify a product, set type="unknown_product" (20% for fish, 15% for meat, 10% for vegetables, etc.)
 - Normalize all units consistently (convert tbsp to ml, cups to dl, etc.)
 
+PRICE SANITY CHECK — VERY IMPORTANT:
+- Products with unit [FRP], [ST], [KRT] are often sold in BULK packages (cartons, cases, crates), NOT individual pieces
+- Example: "Ägg M frigående [FRP] 389 SEK" = a CARTON of ~120 eggs at 389 kr, NOT 389 kr per egg
+- When you match a recipe ingredient (e.g. "12 eggs") to a product sold per FRP/carton, set needs_clarification=true with type="price_check" and ask: "This product is sold per carton (FRP) at X kr. How many pieces per carton?" with options like ["120", "90", "60", "30", "Other"]
+- Similarly, if a matched price seems unreasonably high per unit (e.g. >50 kr for a single egg, >20 kr for 1g of sugar), flag it for clarification
+- Common sense: eggs ~2-5 kr each, butter ~100-150 kr/kg, milk ~15-25 kr/L, cream ~30-50 kr/L, sugar ~15-30 kr/kg
+
 - IMPORTANT: Extract ALL cooking instructions, method steps, and preparation notes into the "notes" field. Lines starting with "-" or describing cooking methods/techniques are NOT ingredients — they go into notes. Include the full process/method.
 
 Return ONLY valid JSON, no markdown formatting."""
