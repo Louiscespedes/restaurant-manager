@@ -624,13 +624,27 @@ Return ONLY valid JSON, no markdown formatting."""
             if product:
                 ing["product_id"] = product.id
                 ing["matched_product_name"] = product.name
-                # Pre-convert price from per-kg/liter to per ingredient unit
-                raw_price = _adjust_price_for_package_size(product.name, product.current_price or 0)
-                ing_unit = ing.get("unit", "kg")
-                ing["unit_price"] = round(_convert_price_to_ingredient_unit(raw_price, ing_unit), 4)
-                ing["raw_price_per_base_unit"] = raw_price
-                ing["price_unit"] = ing_unit
                 ing["supplier_name"] = product.supplier.name if product.supplier else None
+
+                # Calculate unit price — handle bulk packages (FRP/KRT with package_quantity)
+                raw_price = product.current_price or 0
+                product_unit = (product.unit or "").lower()
+                ing_unit = (ing.get("unit") or "st").lower()
+
+                if raw_price <= 0:
+                    ing["unit_price"] = 0
+                elif product.package_quantity and product.package_quantity > 0 and product_unit in ("frp", "krt", "kartong", "back", "lda"):
+                    # Bulk package: price is for the whole carton, divide by piece count
+                    price_per_piece = raw_price / product.package_quantity
+                    ing["unit_price"] = round(price_per_piece, 4)
+                    ing["package_quantity"] = product.package_quantity
+                else:
+                    # Use existing helper functions for kg/L package adjustments
+                    adjusted_price = _adjust_price_for_package_size(product.name, raw_price)
+                    ing["unit_price"] = round(_convert_price_to_ingredient_unit(adjusted_price, ing_unit), 4)
+                    ing["raw_price_per_base_unit"] = adjusted_price
+
+                ing["price_unit"] = ing_unit
                 ing["needs_clarification"] = False
                 ing["matched_product_confidence"] = ing.get("matched_product_confidence") or "medium"
             else:
