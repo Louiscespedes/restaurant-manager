@@ -45,6 +45,7 @@ For each product line, extract:
 - unit_price: price per unit (A-pris, Pris, etc.) — this should be the price EXCLUDING VAT
 - total: line total (Summa, Belopp, etc.) — EXCLUDING VAT
 - package_weight_grams: if the product is sold per unit (st, burk, forp, pase, ask, etc.) and the description shows a weight (e.g. "100g", "500g", "1kg", "200ml"), extract that weight in GRAMS. If sold by kg or liter already, set to null. If no weight info visible, set to null. Convert: 1kg=1000g, 1l=1000ml, use ml as grams approx.
+- package_quantity: the TOTAL number of individual pieces/items in one package. Look for patterns like "8x20st" (= 160), "6x1L" (= 6), "4x2.5kg" (= 4), "12x500ml" (= 12), "10x6st" (= 60), "20st" (= 20), "2x12st" (= 24). IMPORTANT: multiply all parts together, e.g. "8x20st" = 8*20 = 160, NOT 8 or 20. If the product is sold by kg or liter with no pack count, set to null. This is CRITICAL for products sold per FRP/KRT/carton — these are bulk packages containing many individual items.
 
 Important:
 - Use decimal points (not commas) for numbers: 0.493 not 0,493
@@ -54,7 +55,7 @@ Important:
 - Include ALL product lines, even if they span multiple pages
 
 Return ONLY a valid JSON array. No markdown, no explanation, just the JSON array.
-Example: [{{"article_number": "16004", "description": "Tonfiskbuk", "quantity": 0.493, "unit": "kg", "unit_price": 964.0, "total": 475.25, "package_weight_grams": null}}]
+Example: [{{"article_number": "16004", "description": "Tonfiskbuk", "quantity": 0.493, "unit": "kg", "unit_price": 964.0, "total": 475.25, "package_weight_grams": null, "package_quantity": null}}, {{"article_number": "12345", "description": "Agg M frigaende 8x20st", "quantity": 1, "unit": "FRP", "unit_price": 389.0, "total": 389.0, "package_weight_grams": null, "package_quantity": 160}}]
 
 If you cannot extract any products, return an empty array: []"""
 
