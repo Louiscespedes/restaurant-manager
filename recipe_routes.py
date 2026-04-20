@@ -665,7 +665,6 @@ Return ONLY valid JSON, no markdown formatting."""
                     terms_text = translate_resp.content[0].text.strip()
                     if terms_text.startswith("["):
                         search_terms = json.loads(terms_text)
-                        from sqlalchemy import or_
                         conditions = [Product.name.ilike(f"%{t}%") for t in search_terms]
                         matches = db.query(Product).filter(or_(*conditions)).limit(10).all()
                 except Exception as e:
