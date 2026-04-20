@@ -44,6 +44,7 @@ class Product(Base):
     current_price = Column(Float, nullable=True)
     category = Column(String, nullable=True)
     package_weight_grams = Column(Float, nullable=True)  # Weight per package for unit normalization
+    package_quantity = Column(Float, nullable=True)  # Number of pieces per package (e.g. 160 for "8x20st" eggs)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -89,6 +90,7 @@ class InvoiceLineItem(Base):
     total = Column(Float, nullable=True)
     vat_percent = Column(Float, nullable=True)
     package_weight_grams = Column(Float, nullable=True)  # Weight per package in grams
+    package_quantity = Column(Float, nullable=True)  # Number of pieces per package
 
     invoice = relationship('Invoice', back_populates='line_items')
     product = relationship('Product')
