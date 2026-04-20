@@ -218,6 +218,7 @@ def extract_invoice_products(invoice_id=None, force=False):
                 unit_price = prod_data.get('unit_price', 0)
                 total = prod_data.get('total', 0)
                 pkg_weight = prod_data.get('package_weight_grams')
+                pkg_quantity = prod_data.get('package_quantity')
 
                 if not description and not article_number:
                     continue
@@ -239,6 +240,10 @@ def extract_invoice_products(invoice_id=None, force=False):
                     pkg_weight = float(pkg_weight) if pkg_weight else None
                 except (ValueError, TypeError):
                     pkg_weight = None
+                try:
+                    pkg_quantity = float(pkg_quantity) if pkg_quantity else None
+                except (ValueError, TypeError):
+                    pkg_quantity = None
 
                 # Find or create product
                 product = None
@@ -259,7 +264,8 @@ def extract_invoice_products(invoice_id=None, force=False):
                         supplier_id=invoice.supplier_id,
                         unit=unit or None,
                         current_price=unit_price if unit_price > 0 else None,
-                        package_weight_grams=pkg_weight
+                        package_weight_grams=pkg_weight,
+                        package_quantity=pkg_quantity
                     )
                     db.add(product)
                     db.flush()
@@ -274,7 +280,8 @@ def extract_invoice_products(invoice_id=None, force=False):
                     unit=unit,
                     unit_price=unit_price,
                     total=total,
-                    package_weight_grams=pkg_weight
+                    package_weight_grams=pkg_weight,
+                    package_quantity=pkg_quantity
                 )
                 db.add(line_item)
 
@@ -291,6 +298,8 @@ def extract_invoice_products(invoice_id=None, force=False):
                     product.current_price = unit_price
                     if pkg_weight:
                         product.package_weight_grams = pkg_weight
+                    if pkg_quantity:
+                        product.package_quantity = pkg_quantity
 
                 total_products += 1
 
