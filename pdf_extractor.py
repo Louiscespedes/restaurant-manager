@@ -39,13 +39,12 @@ Invoice number: {invoice_number}
 
 For each product line, extract:
 - article_number: the supplier's article/product number (Art nummer, Artikelnr, etc.)
-- description: the FULL product description exactly as shown on the invoice, including brand, size, pack info, and country code (e.g. "Ägg M frigående Sysco Classic 8x20 st SE"). Do NOT shorten or clean up the description — keep ALL text from the product line.
+- description: the FULL product description exactly as it appears on the invoice line, including brand name, pack size info (e.g. "8x20 st", "1x500 g"), and country code. Example: "Ägg M frigående Sysco Classic 8x20 st SE". Do NOT shorten, summarize, or clean up — copy the full text.
 - quantity: the amount ordered (Antal, Kvantitet, Levererat, etc.) — use the DELIVERED quantity if both ordered and delivered are shown
 - unit: the unit of measure (kg, st, liter, forp, etc.)
 - unit_price: price per unit (A-pris, Pris, etc.) — this should be the price EXCLUDING VAT
 - total: line total (Summa, Belopp, etc.) — EXCLUDING VAT
 - package_weight_grams: if the product is sold per unit (st, burk, forp, pase, ask, etc.) and the description shows a weight (e.g. "100g", "500g", "1kg", "200ml"), extract that weight in GRAMS. If sold by kg or liter already, set to null. If no weight info visible, set to null. Convert: 1kg=1000g, 1l=1000ml, use ml as grams approx.
-- package_quantity: the TOTAL number of individual pieces/items in one package. Look for patterns like "8x20st" (= 160), "6x1L" (= 6), "4x2.5kg" (= 4), "12x500ml" (= 12), "10x6st" (= 60), "20st" (= 20), "2x12st" (= 24). IMPORTANT: multiply all parts together, e.g. "8x20st" = 8*20 = 160, NOT 8 or 20. If the product is sold by kg or liter with no pack count, set to null. This is CRITICAL for products sold per FRP/KRT/carton — these are bulk packages containing many individual items.
 
 Important:
 - Use decimal points (not commas) for numbers: 0.493 not 0,493
@@ -53,9 +52,10 @@ Important:
 - If quantity is 0 or missing, try to calculate it from total / unit_price
 - Skip summary lines, VAT lines, freight/shipping lines, and rounding lines
 - Include ALL product lines, even if they span multiple pages
+- The description field is CRITICAL — include the complete text from the invoice line including pack sizes like "1x2 kg", "8x20 st", "1x500 g"
 
 Return ONLY a valid JSON array. No markdown, no explanation, just the JSON array.
-Example: [{{"article_number": "16004", "description": "Tonfiskbuk", "quantity": 0.493, "unit": "kg", "unit_price": 964.0, "total": 475.25, "package_weight_grams": null, "package_quantity": null}}, {{"article_number": "12345", "description": "Agg M frigaende 8x20st", "quantity": 1, "unit": "FRP", "unit_price": 389.0, "total": 389.0, "package_weight_grams": null, "package_quantity": 160}}]
+Example: [{{"article_number": "16004", "description": "Tonfiskbuk 1xca2 kg CL", "quantity": 0.493, "unit": "kg", "unit_price": 964.0, "total": 475.25, "package_weight_grams": null}}, {{"article_number": "12345", "description": "Agg M frigaende Sysco Classic 8x20 st SE", "quantity": 1, "unit": "FRP", "unit_price": 389.0, "total": 389.0, "package_weight_grams": null}}]
 
 If you cannot extract any products, return an empty array: []"""
 
