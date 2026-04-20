@@ -4,6 +4,7 @@ Syncs suppliers, invoices, and extracts product line items from invoice PDFs.
 Runs auto-sync on startup and provides manual sync triggers.
 """
 import logging
+import re
 import threading
 from datetime import datetime, timedelta
 from sqlalchemy import func
@@ -16,6 +17,49 @@ from fortnox_client import FortnoxClient
 from pdf_extractor import extract_products_from_pdf
 
 logger = logging.getLogger(__name__)
+
+
+def parse_package_quantity(description):
+    """
+    Parse package quantity from product description using regex.
+    Handles patterns like: 8x20st, 1x40x125g, 6x1L, 12x500ml, 20st, 2x12st
+    Returns total piece count (e.g. 8x20=160) or None if no pattern found.
+    """
+    if not description:
+        return None
+
+    desc = description.lower()
+
+    # Pattern 1: NxNxN format like "1x40x125 g" -> pieces = 1*40 = 40
+    m = re.search(r'(\d+)\s*x\s*(\d+)\s*x\s*[\d.,]+\s*(g|kg|ml|cl|l)\b', desc)
+    if m:
+        count = int(m.group(1)) * int(m.group(2))
+        if count > 1:
+            return float(count)
+
+    # Pattern 2: NxN st/stk format like "8x20 st" -> 8*20 = 160
+    m = re.search(r'(\d+)\s*x\s*(\d+)\s*(?:st|stk|pk)\b', desc)
+    if m:
+        count = int(m.group(1)) * int(m.group(2))
+        if count > 1:
+            return float(count)
+
+    # Pattern 3: NxN (without unit) but only if sold as FRP/KRT
+    m = re.search(r'(\d+)\s*x\s*(\d+)(?!\s*(?:g|kg|ml|cl|l|,|\.)\b)', desc)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 1 and b > 1 and a * b > 2:
+            return float(a * b)
+
+    # Pattern 4: Just "Nst" or "N st" like "20st" -> 20
+    m = re.search(r'(?<!\d)(\d+)\s*(?:st|stk)\b', desc)
+    if m:
+        count = int(m.group(1))
+        if count > 1:
+            return float(count)
+
+    return None
+
 
 # Global sync state
 sync_status = {
@@ -248,6 +292,12 @@ def extract_invoice_products(invoice_id=None, force=False):
                     pkg_quantity = float(pkg_quantity) if pkg_quantity else None
                 except (ValueError, TypeError):
                     pkg_quantity = None
+
+                # Fallback: parse package_quantity from description using regex
+                if pkg_quantity is None and description:
+                    pkg_quantity = parse_package_quantity(description)
+                    if pkg_quantity:
+                        logger.info(f'Regex parsed pkg_quantity={pkg_quantity} from desc="{description}"')
 
                 # Find or create product
                 product = None
