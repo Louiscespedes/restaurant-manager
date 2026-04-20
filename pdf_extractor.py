@@ -103,6 +103,17 @@ If you cannot extract any products, return an empty array: []"""
                 text = text[:-3]
             text = text.strip()
 
+        # Handle case where Claude adds preamble text before JSON array
+        if not text.startswith('['):
+            # Try to find the JSON array in the response
+            bracket_idx = text.find('[')
+            if bracket_idx >= 0:
+                text = text[bracket_idx:]
+                # Find matching closing bracket
+                last_bracket = text.rfind(']')
+                if last_bracket >= 0:
+                    text = text[:last_bracket + 1]
+
         products = json.loads(text)
 
         if not isinstance(products, list):
