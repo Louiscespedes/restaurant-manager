@@ -12,7 +12,8 @@ from sqlalchemy import func, or_
 from food_dictionary import search_food_terms
 from models import (
     Session, Recipe, RecipeIngredient, Dish, DishComponent,
-    Menu, MenuItem, Product, InvoiceLineItem, PriceHistory
+    Menu, MenuItem, Product, InvoiceLineItem, PriceHistory,
+    ProductAlias
 )
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,46 @@ def _apply_recipe_answer(session, question_id, answer):
             db.close()
     else:
         ing["needs_clarification"] = False
+    # Save alias for future sessions (so AI never asks this again)
+    try:
+        if q_type in ("product_match", "cut_variant", "unknown_product", "no_invoice_match") and answer.lower() != "skip":
+            original_input = question.get("item_description", "")
+            if original_input:
+                db = Session()
+                try:
+                    # Check if alias already exists
+                    existing = db.query(ProductAlias).filter(
+                        func.lower(ProductAlias.user_input) == original_input.lower().strip()
+                    ).first()
+                    if existing:
+                        existing.use_count += 1
+                        existing.updated_at = datetime.utcnow()
+                        if ing.get("product_id"):
+                            existing.matched_product_id = ing["product_id"]
+                        if ing.get("matched_product_name"):
+                            existing.matched_product_name = ing["matched_product_name"]
+                    else:
+                        alias = ProductAlias(
+                            user_input=original_input.strip(),
+                            matched_product_id=ing.get("product_id"),
+                            matched_product_name=ing.get("matched_product_name") or ing.get("description") or answer,
+                            category=ing.get("category"),
+                            default_unit=ing.get("unit"),
+                            default_supplier=ing.get("supplier_name"),
+                            is_manual=not bool(ing.get("product_id")),
+                            source="recipe"
+                        )
+                        db.add(alias)
+                    db.commit()
+                    logger.info(f"Saved recipe alias: '{original_input}' -> '{ing.get('matched_product_name') or answer}'")
+                except Exception as e:
+                    db.rollback()
+                    logger.warning(f"Failed to save recipe alias: {e}")
+                finally:
+                    db.close()
+    except Exception as e:
+        logger.warning(f"Recipe alias save error (non-fatal): {e}")
+
     all_answered = all(q["is_answered"] for q in session["questions"])
     if all_answered:
         session["status"] = "ready"
@@ -595,12 +636,35 @@ def parse_recipe_text():
 
         products_context = "\n".join(product_list[:200])  # Limit context size
 
+        # Load previously confirmed aliases
+        aliases = db.query(ProductAlias).order_by(ProductAlias.use_count.desc()).limit(200).all()
+        alias_list = []
+        for a in aliases:
+            entry = f"- \"{a.user_input}\" = \"{a.matched_product_name or a.user_input}\""
+            if a.matched_product_id:
+                product_alias = db.query(Product).filter_by(id=a.matched_product_id).first()
+                if product_alias:
+                    entry += f" [{product_alias.unit or ''}] {product_alias.current_price or ''} SEK"
+                    if product_alias.supplier:
+                        entry += f" ({product_alias.supplier.name})"
+            elif a.is_manual:
+                entry += " [manual price]"
+            if a.category:
+                entry += f" cat:{a.category}"
+            alias_list.append(entry)
+        aliases_context = "\n".join(alias_list) if alias_list else "None yet"
+
         prompt = f"""You are a recipe parser for a restaurant. Parse the following messy recipe text into structured data.
 
 The text may be in French, English, or Swedish. Normalize everything to a clean format.
 
 KNOWN PRODUCTS FROM INVOICES (match ingredients to these when possible):
 {products_context}
+
+PREVIOUSLY CONFIRMED MAPPINGS (user has already told us what these items are \u2014 use these silently without asking):
+{aliases_context}
+
+IMPORTANT: If an item matches a PREVIOUSLY CONFIRMED MAPPING, use that mapping directly. Set needs_clarification=false and use the confirmed product name. Do NOT ask about items that have already been confirmed.
 
 RECIPE TEXT:
 {raw_text}
