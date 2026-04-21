@@ -390,6 +390,43 @@ def search_products():
         db.close()
 
 
+# --- Price Estimation (fallback for products not in invoices) ---
+
+@app.route("/api/estimate-price", methods=["POST"])
+def estimate_price():
+    """Estimate wholesale price for a product not found in invoices."""
+    from price_estimator import estimate_product_price
+    data = request.get_json()
+    product_name = data.get("product_name", "").strip()
+    unit = data.get("unit", "kg")
+    category = data.get("category")
+
+    if not product_name:
+        return jsonify({"error": "product_name is required"}), 400
+
+    estimate = estimate_product_price(product_name, unit=unit, category=category)
+    if estimate:
+        return jsonify(estimate)
+    return jsonify({"error": "Could not estimate price", "product_name": product_name}), 404
+
+
+@app.route("/api/estimate-prices-batch", methods=["POST"])
+def estimate_prices_batch_endpoint():
+    """Estimate prices for multiple products without invoice data."""
+    from price_estimator import estimate_prices_batch
+    data = request.get_json()
+    items = data.get("items", [])
+
+    if not items:
+        return jsonify({"error": "items array is required"}), 400
+
+    estimates = estimate_prices_batch(items)
+    return jsonify({
+        "estimates": estimates,
+        "count": len(estimates)
+    })
+
+
 # --- Invoices ---
 
 @app.route("/api/invoices", methods=["GET"])
