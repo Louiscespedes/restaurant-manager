@@ -300,6 +300,31 @@ class InventoryItem(Base):
     recipe = relationship('Recipe')
 
 
+# ─── Product Alias System ──────────────────────────────────────────────────────
+
+class ProductAlias(Base):
+    """Maps user input terms to known products.
+    Stores every user correction so the AI never asks the same question twice.
+    Cross-language: bakpulver → baking powder → levure chimique all map to the same product.
+    """
+    __tablename__ = 'product_aliases'
+
+    id = Column(Integer, primary_key=True)
+    user_input = Column(String, nullable=False)           # what the user typed or AI parsed
+    matched_product_id = Column(Integer, ForeignKey('products.id'), nullable=True)  # linked product (null if manual)
+    matched_product_name = Column(String, nullable=True)  # the confirmed product name
+    category = Column(String, nullable=True)              # product category
+    default_unit = Column(String, nullable=True)          # preferred unit for this item
+    default_supplier = Column(String, nullable=True)      # preferred supplier
+    is_manual = Column(Boolean, default=False)            # True if no invoice product exists
+    source = Column(String, default='user')               # 'user', 'inventory', 'recipe'
+    use_count = Column(Integer, default=1)                # how many times this alias has been used
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    product = relationship('Product')
+
+
 def init_db():
     """Create all tables and run migrations."""
     from sqlalchemy import inspect, text
