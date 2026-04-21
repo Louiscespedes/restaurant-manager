@@ -470,6 +470,125 @@ def delete_alias(alias_id):
         db.close()
 
 
+# --- Dish Builder Search Endpoints ------------------------------------------------
+
+@app.route("/api/search/products", methods=["GET"])
+def search_products_for_dish():
+    """
+    Cross-language product search for the dish builder.
+    Uses bilingual food dictionary + product alias table.
+    """
+    db = Session()
+    try:
+        q = request.args.get("q", "").strip()
+        if not q or len(q) < 2:
+            return jsonify([])
+
+        # Step 1: Get bilingual search terms from food dictionary
+        search_terms = search_food_terms(q)
+
+        # Step 2: Check product alias table for previously confirmed mappings
+        alias_product_ids = []
+        try:
+            from sqlalchemy import text as sql_text
+            alias_rows = db.execute(
+                sql_text("SELECT matched_product_id, matched_product_name FROM product_aliases WHERE LOWER(user_input) LIKE :q AND matched_product_id IS NOT NULL ORDER BY use_count DESC LIMIT 10"),
+                {"q": "%" + q.lower() + "%"}
+            ).fetchall()
+            alias_product_ids = [r[0] for r in alias_rows if r[0]]
+            for r in alias_rows:
+                if r[1]:
+                    search_terms.add(r[1].lower())
+        except Exception:
+            pass
+
+        # Step 3: Build search conditions
+        conditions = []
+        for term in search_terms:
+            like_term = "%" + term + "%"
+            conditions.append(Product.name.ilike(like_term))
+
+        if alias_product_ids:
+            conditions.append(Product.id.in_(alias_product_ids))
+
+        if not conditions:
+            return jsonify([])
+
+        products = db.query(Product).filter(
+            or_(*conditions)
+        ).order_by(Product.name).limit(30).all()
+
+        results = []
+        for prod in products:
+            results.append({
+                "id": prod.id,
+                "name": prod.name,
+                "supplier_name": prod.supplier.name if prod.supplier else None,
+                "unit": prod.unit,
+                "latest_price": prod.current_price,
+                "current_price": prod.current_price,
+                "category": prod.category,
+                "article_number": prod.fortnox_article_number,
+                "package_weight_grams": prod.package_weight_grams
+            })
+
+        return jsonify(results)
+    finally:
+        db.close()
+
+
+@app.route("/api/search/recipes", methods=["GET"])
+def search_recipes_for_dish():
+    """
+    Cross-language recipe search for the dish builder.
+    Uses bilingual food dictionary for matching.
+    """
+    db = Session()
+    try:
+        q = request.args.get("q", "").strip()
+        if not q or len(q) < 2:
+            return jsonify([])
+
+        search_terms = search_food_terms(q)
+
+        conditions = []
+        for term in search_terms:
+            like_term = "%" + term + "%"
+            conditions.append(Recipe.name.ilike(like_term))
+            conditions.append(Recipe.category.ilike(like_term))
+
+        if not conditions:
+            return jsonify([])
+
+        recipes = db.query(Recipe).filter(
+            or_(*conditions)
+        ).order_by(Recipe.name).limit(30).all()
+
+        results = []
+        for r in recipes:
+            ingredients = db.query(RecipeIngredient).filter_by(recipe_id=r.id).all()
+            total_cost = sum(
+                (ing.quantity or 0) * (ing.unit_price or 0)
+                for ing in ingredients
+            )
+            portions = r.portions or 1
+            cost_per_portion = round(total_cost / portions, 2) if portions > 0 else 0
+
+            results.append({
+                "id": r.id,
+                "name": r.name,
+                "category": r.category,
+                "portions": r.portions,
+                "cost_per_portion": cost_per_portion,
+                "total_cost": round(total_cost, 2),
+                "ingredient_count": len(ingredients)
+            })
+
+        return jsonify(results)
+    finally:
+        db.close()
+
+
 # --- Invoices ---
 
 @app.route("/api/invoices", methods=["GET"])
