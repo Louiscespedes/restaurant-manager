@@ -132,6 +132,56 @@ def _apply_recipe_answer(session, question_id, answer):
                     ing["raw_price_per_base_unit"] = raw_price
         finally:
             db.close()
+    elif q_type == "no_invoice_match":
+        # AI recognized the ingredient but it's not in invoices
+        if answer.startswith("Yes, use") or answer.startswith("Yes"):
+            ing["needs_clarification"] = False
+            ing["matched_product_confidence"] = "none"
+        elif answer.strip().lower() == "skip":
+            ing["needs_clarification"] = False
+        else:
+            custom_name = answer.strip()
+            if custom_name and custom_name.lower() != "enter custom name":
+                ing["description"] = custom_name
+            ing["needs_clarification"] = False
+            # Try to find in DB
+            db = Session()
+            try:
+                search_name = custom_name if custom_name and custom_name.lower() != "enter custom name" else ing.get("description", "")
+                matches = db.query(Product).filter(
+                    Product.name.ilike(f"%{search_name[:30]}%")
+                ).limit(5).all()
+                if len(matches) == 1:
+                    product = matches[0]
+                    ing["matched_product_name"] = product.name
+                    ing["product_id"] = product.id
+                    if product.current_price:
+                        ing["unit_price"] = product.current_price
+                    if product.supplier:
+                        ing["supplier_name"] = product.supplier.name
+                    ing["matched_product_confidence"] = "high"
+                elif len(matches) > 1:
+                    options = []
+                    for p in matches:
+                        price_str = f"{p.current_price:.2f} SEK" if p.current_price else "no price"
+                        supplier_str = p.supplier.name if p.supplier else "unknown"
+                        options.append(f"{p.name} - {price_str} ({supplier_str})")
+                    options.append("Skip")
+                    new_q = {
+                        "id": max(q["id"] for q in session["questions"]) + 1,
+                        "item_index": item_idx,
+                        "type": "product_match",
+                        "item_description": search_name,
+                        "question": f"Found {len(matches)} products matching '{search_name}'. Which one?",
+                        "options": options,
+                        "answer": None,
+                        "is_answered": False
+                    }
+                    current_pos = session["questions"].index(question)
+                    session["questions"].insert(current_pos + 1, new_q)
+            finally:
+                db.close()
+
     elif q_type == "unknown_product":
         user_product_name = answer.strip()
         ing["description"] = user_product_name
@@ -551,7 +601,9 @@ Return a JSON object with this structure:
       "matched_product_name": "name of matched product from invoice list, or null if no match",
       "matched_product_confidence": "high, medium, low, or none",
       "needs_clarification": true/false,
-      "clarification_question": "question to ask the user if needs_clarification is true, e.g. 'Which supplier for carrots: Sorunda or Menigo?'",
+      "clarification_type": "product_match, supplier_choice, unknown_product, no_invoice_match, or null",
+      "clarification_question": "question to ask the user if needs_clarification is true",
+      "clarification_options": ["option1", "option2"] or null,
       "suggested_trimming_percent": number or 0
     }}
   ],
@@ -566,7 +618,11 @@ Be smart about matching:
 - BE AGGRESSIVE about flagging clarifications — better to ask than guess wrong
 - If multiple suppliers sell the same product, set needs_clarification=true, type="supplier_choice", and list supplier names as options
 - If a product name matches multiple items, set type="product_match" and list the options
-- If you cannot identify a product, set type="unknown_product" (20% for fish, 15% for meat, 10% for vegetables, etc.)
+- Suggest trimming percentages for common items (20% for fish, 15% for meat, 10% for vegetables, etc.)
+- IMPORTANT: Distinguish between TWO cases when a product is not in KNOWN PRODUCTS:
+  1. You KNOW what the ingredient is (e.g. baking powder, vanilla, corn starch) but it's not in invoices: set clarification_type="no_invoice_match", question="I recognize '[name]' but couldn't find it in your invoices. Use this name or enter your own?", options=["Yes, use '[name]'", "Enter custom name"]
+  2. You genuinely CANNOT determine what the product is: set clarification_type="unknown_product", question="I don't recognize '[name]'. What product is this?", options=["Type the product name"]. LAST RESORT only.
+  Common ingredients (flour, sugar, salt, baking powder, spices, oils, vinegar, etc.) are ALWAYS case 1, never case 2.
 - Normalize all units consistently (convert tbsp to ml, cups to dl, etc.)
 
 PRICE SANITY CHECK — VERY IMPORTANT:
