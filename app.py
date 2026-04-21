@@ -41,7 +41,6 @@ def run_migrations():
             "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
             "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_quantity FLOAT",
             "ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
-        ,
             "CREATE TABLE IF NOT EXISTS product_aliases (id SERIAL PRIMARY KEY, user_input VARCHAR NOT NULL, matched_product_id INTEGER REFERENCES products(id), matched_product_name VARCHAR, category VARCHAR, default_unit VARCHAR, default_supplier VARCHAR, is_manual BOOLEAN DEFAULT FALSE, source VARCHAR DEFAULT 'user', use_count INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         ]
         for sql in migrations:
