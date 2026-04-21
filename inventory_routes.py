@@ -1088,6 +1088,25 @@ def confirm_review_session(session_id):
                 if product.supplier and not item_data.get("supplier_name"):
                     item_data["supplier_name"] = product.supplier.name
 
+        # Auto-estimate prices for items without invoice data
+        try:
+            from price_estimator import estimate_product_price
+            for item_data in session_data["items"]:
+                price = item_data.get("unit_price")
+                if not price or price <= 0:
+                    desc = item_data.get("description", "")
+                    unit = item_data.get("unit", "kg")
+                    category = item_data.get("category")
+                    estimate = estimate_product_price(desc, unit=unit, category=category)
+                    if estimate and estimate.get("estimated_price"):
+                        item_data["unit_price"] = estimate["estimated_price"]
+                        item_data["is_estimated_price"] = True
+                        item_data["price_confidence"] = estimate.get("confidence", "low")
+                        item_data["is_manual_price"] = True  # Flag as non-invoice price
+                        logger.info(f"Estimated price for '{desc}': {estimate['estimated_price']} SEK/{unit}")
+        except Exception as e:
+            logger.warning(f"Price estimation step failed (non-fatal): {e}")
+
         total = 0
         for item_data in session_data["items"]:
             qty = item_data.get("quantity") or 0
