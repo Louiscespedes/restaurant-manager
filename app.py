@@ -13,7 +13,7 @@ from models import (
     Session, Base, engine, Supplier, Product, Invoice,
     InvoiceLineItem, PriceHistory, SyncLog, FortnoxToken, init_db,
     Recipe, RecipeIngredient, Dish, DishComponent, Menu, MenuItem,
-    Inventory, InventoryItem
+    Inventory, InventoryItem, ProductAlias
 )
 from config import FORTNOX_CLIENT_ID, FORTNOX_CLIENT_SECRET, FORTNOX_REDIRECT_URI
 from food_dictionary import search_food_terms
@@ -41,6 +41,8 @@ def run_migrations():
             "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_weight_grams FLOAT",
             "ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS package_quantity FLOAT",
             "ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS trimming_pct FLOAT DEFAULT 0",
+        ,
+            "CREATE TABLE IF NOT EXISTS product_aliases (id SERIAL PRIMARY KEY, user_input VARCHAR NOT NULL, matched_product_id INTEGER REFERENCES products(id), matched_product_name VARCHAR, category VARCHAR, default_unit VARCHAR, default_supplier VARCHAR, is_manual BOOLEAN DEFAULT FALSE, source VARCHAR DEFAULT 'user', use_count INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         ]
         for sql in migrations:
             try:
@@ -425,6 +427,48 @@ def estimate_prices_batch_endpoint():
         "estimates": estimates,
         "count": len(estimates)
     })
+
+
+# --- Product Aliases (ingredient memory) ---
+
+@app.route("/api/product-aliases", methods=["GET"])
+def list_aliases():
+    """List all product aliases."""
+    db = Session()
+    try:
+        aliases = db.query(ProductAlias).order_by(ProductAlias.use_count.desc()).all()
+        return jsonify([{
+            "id": a.id,
+            "user_input": a.user_input,
+            "matched_product_id": a.matched_product_id,
+            "matched_product_name": a.matched_product_name,
+            "category": a.category,
+            "default_unit": a.default_unit,
+            "default_supplier": a.default_supplier,
+            "is_manual": a.is_manual,
+            "use_count": a.use_count,
+            "created_at": a.created_at.isoformat() if a.created_at else None
+        } for a in aliases])
+    finally:
+        db.close()
+
+
+@app.route("/api/product-aliases/<int:alias_id>", methods=["DELETE"])
+def delete_alias(alias_id):
+    """Delete a product alias."""
+    db = Session()
+    try:
+        alias = db.query(ProductAlias).filter_by(id=alias_id).first()
+        if not alias:
+            return jsonify({"error": "Alias not found"}), 404
+        db.delete(alias)
+        db.commit()
+        return jsonify({"message": f"Alias '{alias.user_input}' deleted"})
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
 
 
 # --- Invoices ---
