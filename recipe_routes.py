@@ -435,6 +435,23 @@ def create_recipe():
         db.add(recipe)
         db.flush()
 
+        # Auto-estimate prices for ingredients without invoice data
+        try:
+            from price_estimator import estimate_product_price
+            for ing_data in data.get("ingredients", []):
+                price = ing_data.get("unit_price")
+                if not price or price <= 0:
+                    desc = ing_data.get("description", "")
+                    unit = ing_data.get("unit", "kg")
+                    category = data.get("category")
+                    estimate = estimate_product_price(desc, unit=unit, category=category)
+                    if estimate and estimate.get("estimated_price"):
+                        ing_data["unit_price"] = estimate["estimated_price"]
+                        ing_data["is_manual_price"] = True
+                        logger.info(f"Estimated price for recipe ingredient '{desc}': {estimate['estimated_price']} SEK/{unit}")
+        except Exception as e:
+            logger.warning(f"Price estimation for recipe failed (non-fatal): {e}")
+
         # Add ingredients
         for ing_data in data.get("ingredients", []):
             ing = RecipeIngredient(
