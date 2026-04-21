@@ -171,8 +171,12 @@ Rules:
 - Prices from suppliers are ALWAYS per kg (weight) or per liter (volume) or per piece (st) -- never per gram or ml
 - When setting unit_price, use the per-kg or per-liter price -- the server normalizes quantities automatically
 - ALWAYS output the "description" field in ENGLISH (translate Swedish/other languages to English). Example: "Tomat grön" -> "Green tomato", "Morötter" -> "Carrots", "Lax" -> "Salmon". Keep matched_product_name in the ORIGINAL language (Swedish) for database matching.
-- If you genuinely CANNOT determine what a product is even with culinary knowledge, flag with type "unknown_product". Question: "I don't recognize '[item name]'. What product is this?" Options: ["Type the product name"]. This is a LAST RESORT -- use your food knowledge first.
-- When a generic term like "corn" is used, ask with type "product_match": "You wrote 'corn 2kg'. What did you mean?" with options like ["Sweet corn on cob", "Corn flour", "Canned corn", "Cornstarch", "Other - type below"]
+- IMPORTANT: Distinguish between TWO cases when a product is not in the KNOWN PRODUCTS list:
+  1. You KNOW what the ingredient is (e.g. baking powder, vanilla extract, corn starch) but it's not in the invoice data: use clarification_type "no_invoice_match". Question: "I recognize '[item name]' but couldn't find it in your invoices. Use this name or enter your own?" Options: ["Yes, use '[item name]'", "Enter custom name"]. Set matched_product_confidence to "none".
+  2. You genuinely CANNOT determine what the product is even with culinary knowledge (gibberish, extreme typos, ambiguous abbreviations): use clarification_type "unknown_product". Question: "I don't recognize '[item name]'. What product is this?" Options: ["Type the product name"]. This is a LAST RESORT.
+  Most common ingredients (flour, sugar, salt, baking powder, spices, oils, vinegar, etc.) should ALWAYS be case 1, never case 2.
+- When a generic term like "corn" is used AND matches exist in KNOWN PRODUCTS, ask with type "product_match": "You wrote 'corn 2kg'. What did you mean?" with options like ["Sweet corn on cob", "Corn flour", "Canned corn", "Cornstarch", "Other - type below"]
+- When a specific, well-known ingredient like "baking powder 500g" is used but NOT found in KNOWN PRODUCTS, use "no_invoice_match" — do NOT ask "what is this?". You KNOW what baking powder is.
 - ALWAYS include the quantity and unit from the original text in your parsed output -- never drop the amount
 - When you infer what a product is (e.g. "ottoro" -> bluefin tuna), use your inference to search the KNOWN PRODUCTS list. If you find a match, set matched_product_name to that known product.
 - Return ONLY valid JSON, no markdown"""
@@ -365,6 +369,58 @@ def _apply_answer(session, question_id, answer):
 
     elif q_type == "unit_mismatch":
         item["needs_clarification"] = False
+
+    elif q_type == "no_invoice_match":
+        # AI recognized the ingredient but it's not in invoices
+        # User either confirmed the name or typed a custom one
+        if answer.startswith("Yes, use") or answer.startswith("Yes"):
+            # Keep the AI's recognized name
+            item["needs_clarification"] = False
+            item["matched_product_confidence"] = "none"
+            item["is_manual_price"] = True
+        elif answer.strip().lower() == "skip":
+            item["needs_clarification"] = False
+        else:
+            # User typed a custom name - search invoices for it
+            custom_name = answer.replace("Enter custom name", "").strip()
+            if custom_name and custom_name.lower() != "enter custom name":
+                item["description"] = custom_name
+            item["needs_clarification"] = False
+            # Try to find in DB
+            db = Session()
+            try:
+                search_name = custom_name if custom_name and custom_name.lower() != "enter custom name" else item.get("description", "")
+                matches = db.query(Product).filter(
+                    func.lower(Product.name).like(func.lower(f"%{search_name}%"))
+                ).limit(5).all()
+                if len(matches) == 1:
+                    product = matches[0]
+                    item["matched_product_name"] = product.name
+                    item["product_id"] = product.id
+                    item["unit_price"] = product.latest_price or 0
+                    item["supplier_name"] = product.supplier.name if product.supplier else None
+                    item["matched_product_confidence"] = "high"
+                elif len(matches) > 1:
+                    options = []
+                    for p in matches:
+                        price_str = f"{p.latest_price:.2f} SEK" if p.latest_price else "no price"
+                        supplier_str = p.supplier.name if p.supplier else "unknown"
+                        options.append(f"{p.name} - {price_str} ({supplier_str})")
+                    options.append("Skip")
+                    new_q = {
+                        "id": max(q["id"] for q in session["questions"]) + 1,
+                        "item_index": item_idx,
+                        "type": "product_match",
+                        "item_description": search_name,
+                        "question": f"Found {len(matches)} products matching '{search_name}'. Which one?",
+                        "options": options,
+                        "answer": None,
+                        "is_answered": False
+                    }
+                    current_pos = session["questions"].index(question)
+                    session["questions"].insert(current_pos + 1, new_q)
+            finally:
+                db.close()
 
     elif q_type == "unknown_product":
         # User told us what this product is - search invoices for it
