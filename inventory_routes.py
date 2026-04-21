@@ -20,7 +20,7 @@ from datetime import datetime
 from sqlalchemy import func
 from models import (
     Session, Inventory, InventoryItem,
-    Product, Recipe, RecipeIngredient, PriceHistory
+    Product, Recipe, RecipeIngredient, PriceHistory, ProductAlias
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +126,11 @@ Be smart about typos, abbreviations, and casual notation (e.g., "morot 2kg" mean
 
 KNOWN PRODUCTS FROM INVOICES:
 {products_context}
+
+PREVIOUSLY CONFIRMED MAPPINGS (user has already told us what these items are — use these silently without asking):
+{aliases_context}
+
+IMPORTANT: If an item matches a PREVIOUSLY CONFIRMED MAPPING, use that mapping directly. Set needs_clarification=false and use the confirmed product name. Do NOT ask about items that have already been confirmed.
 
 KNOWN RECIPES (for finished products):
 {recipe_context}
@@ -468,6 +473,46 @@ def _apply_answer(session, question_id, answer):
     else:
         item["needs_clarification"] = False
 
+    # Save alias for future sessions (so AI never asks this again)
+    try:
+        if q_type in ("product_match", "cut_variant", "unknown_product", "no_invoice_match") and answer.lower() != "skip":
+            original_input = question.get("item_description", "")
+            if original_input:
+                db = Session()
+                try:
+                    # Check if alias already exists
+                    existing = db.query(ProductAlias).filter(
+                        func.lower(ProductAlias.user_input) == original_input.lower().strip()
+                    ).first()
+                    if existing:
+                        existing.use_count += 1
+                        existing.updated_at = datetime.utcnow()
+                        if item.get("product_id"):
+                            existing.matched_product_id = item["product_id"]
+                        if item.get("matched_product_name"):
+                            existing.matched_product_name = item["matched_product_name"]
+                    else:
+                        alias = ProductAlias(
+                            user_input=original_input.strip(),
+                            matched_product_id=item.get("product_id"),
+                            matched_product_name=item.get("matched_product_name") or item.get("description") or answer,
+                            category=item.get("category"),
+                            default_unit=item.get("unit"),
+                            default_supplier=item.get("supplier_name"),
+                            is_manual=not bool(item.get("product_id")),
+                            source="inventory"
+                        )
+                        db.add(alias)
+                    db.commit()
+                    logger.info(f"Saved alias: '{original_input}' -> '{item.get('matched_product_name') or answer}'")
+                except Exception as e:
+                    db.rollback()
+                    logger.warning(f"Failed to save alias: {e}")
+                finally:
+                    db.close()
+    except Exception as e:
+        logger.warning(f"Alias save error (non-fatal): {e}")
+
     # Check if all questions are answered
     all_answered = all(q["is_answered"] for q in session["questions"])
     if all_answered:
@@ -751,6 +796,24 @@ def parse_inventory_text():
                 entry += f" cat:{p.category}"
             product_list.append(entry)
         products_context = "\n".join(product_list[:250])
+
+        # Load previously confirmed aliases
+        aliases = db.query(ProductAlias).order_by(ProductAlias.use_count.desc()).limit(200).all()
+        alias_list = []
+        for a in aliases:
+            entry = f"- \"{a.user_input}\" = \"{a.matched_product_name or a.user_input}\""
+            if a.matched_product_id:
+                product = db.query(Product).filter_by(id=a.matched_product_id).first()
+                if product:
+                    entry += f" [{product.unit or ''}] {product.current_price or ''} SEK"
+                    if product.supplier:
+                        entry += f" ({product.supplier.name})"
+            elif a.is_manual:
+                entry += " [manual price]"
+            if a.category:
+                entry += f" cat:{a.category}"
+            alias_list.append(entry)
+        aliases_context = "\n".join(alias_list) if alias_list else "None yet"
 
         # Get known recipes for finished products (with cost info)
         from recipe_routes import calc_recipe_cost
